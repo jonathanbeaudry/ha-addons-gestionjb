@@ -48,7 +48,6 @@ import os
 import platform
 import re
 import socket
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -58,48 +57,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SERVICE_VERSION = "2.0.0"
 
 # UA « navigateur » pour que les sites servent une page normale, pas un blocage API.
-# Réservé à /fetch (urllib) : là, rien ne peut contredire ce qu'on annonce.
+#
+# Oui, il annonce Firefox alors que /render est un Chromium — et non, ce n'est
+# PAS ce qui bloque Waze : la config qui a sorti 32 754 o de vraies alertes le
+# 2026-07-15 était exactement celle-ci. Vérifié en la « corrigeant » (UA Chrome
+# cohérent + navigateur graphique) : 0 succès sur 7 essais. Ne pas refaire ce
+# détour — le vrai levier est le NOMBRE d'appels, pas le déguisement.
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
     "Gecko/20100101 Firefox/140.0"
 )
-
-_UA_RENDER: str | None = None
-
-
-def _ua_chromium(pw) -> str:
-    """UA COHÉRENT avec le vrai navigateur, pour /render. "" si indéterminable.
-
-    Ne JAMAIS servir BROWSER_UA (Firefox) à Chromium : le moteur le contredit à
-    voix haute — il envoie ses en-têtes `Sec-CH-UA`, expose
-    `navigator.userAgentData` et un moteur V8, trois choses que Firefox n'a
-    pas. reCAPTCHA Enterprise teste exactement cette cohérence-là : un
-    navigateur qui se contredit tombe au plancher du score → 403 (le blocage
-    Waze qu'on a mis des heures à croire aléatoire).
-
-    On annonce donc ce qu'on EST — Chrome, sur Linux, à la version du binaire.
-    Version illisible → on rend "" et l'appelant laisse l'UA d'origine : un
-    « HeadlessChrome » honnête vaut mieux qu'une version inventée qui ne
-    collerait pas aux Sec-CH-UA que Chromium enverra de toute façon.
-    """
-    global _UA_RENDER
-    if _UA_RENDER is not None:
-        return _UA_RENDER
-    _UA_RENDER = ""
-    try:
-        sortie = subprocess.run([pw.chromium.executable_path, "--version"],
-                                capture_output=True, text=True,
-                                timeout=10).stdout
-        majeure = re.search(r"\b(\d+)\.[\d.]+", sortie or "")
-        if majeure:
-            _UA_RENDER = (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{majeure.group(1)}.0.0.0 "
-                "Safari/537.36")
-    except Exception as e:  # noqa: BLE001 - pas d'UA ≠ pas de rendu
-        print(f"[render] version Chromium illisible ({e}) — UA d'origine",
-              file=sys.stderr)
-    return _UA_RENDER
 
 # --------------------------------------------------------------------------- #
 # Configuration (lue depuis /data/options.json en add-on HA, ou l'environnement)
@@ -331,49 +298,20 @@ def _render(url: str, referer: str = "", attendre: str = "",
     # Sans --no-sandbox, Chromium refuse de démarrer dans un conteneur
     # d'add-on (pas de user namespaces). L'isolation ici, c'est le
     # conteneur lui-même, pas le bac à sable de Chromium.
-    args_chromium = ["--no-sandbox", "--disable-dev-shm-usage",
-                     # Retire `navigator.webdriver` — le tout premier drapeau
-                     # que lit un anti-robot. Sans effet sur
-                     # chrome-headless-shell, d'où le `channel` plus bas.
-                     "--disable-blink-features=AutomationControlled"]
+    args_chromium = ["--no-sandbox", "--disable-dev-shm-usage"]
+    options_ctx = {"user_agent": BROWSER_UA, "locale": "fr-CA",
+                   "viewport": {"width": 1366, "height": 900}}
 
     with sync_playwright() as pw:
-        options_ctx = {"locale": "fr-CA",
-                       "viewport": {"width": 1366, "height": 900}}
-        ua = _ua_chromium(pw)             # voir _ua_chromium : ne PAS mentir
-        if ua:                            # sur le moteur (Firefox ≠ Chromium)
-            options_ctx["user_agent"] = ua
-
-        # Chromium GRAPHIQUE dès qu'un écran existe (Xvfb, monté par run.sh) :
-        # reCAPTCHA Enterprise note durement le headless, même le « nouveau ».
-        # Pas d'écran → headless quand même : un rendu moins discret vaut mieux
-        # que pas de rendu.
-        sans_tete = not os.environ.get("DISPLAY")
-
-        def _lancer(**extra):
-            """(à fermer, contexte). `extra` = options de lancement en plus."""
-            if profil:
-                # /data = stockage persistant de l'add-on (survit aux MAJ).
-                c = pw.chromium.launch_persistent_context(
-                    os.path.join("/data/profils", profil), headless=sans_tete,
-                    args=args_chromium, **extra, **options_ctx)
-                return c, c               # fermer le contexte ferme le tout
-            n = pw.chromium.launch(headless=sans_tete, args=args_chromium,
-                                   **extra)
-            return n, n.new_context(**options_ctx)
-
-        # channel="chromium" = le VRAI Chromium en « nouveau headless », plutôt
-        # que `chrome-headless-shell` (le défaut de Playwright) : un binaire
-        # allégé, sans extensions ni certaines API JS — des trous qu'un
-        # anti-robot repère au premier coup d'œil. Playwright trop vieux pour ce
-        # channel → on retombe sur le défaut : un rendu moins discret vaut mieux
-        # que pas de rendu du tout.
-        try:
-            nav, ctx = _lancer(channel="chromium")
-        except Exception as e:  # noqa: BLE001 - channel absent = pas fatal
-            print(f"[render] channel chromium indisponible ({e}) — défaut",
-                  file=sys.stderr)
-            nav, ctx = _lancer()
+        if profil:
+            # /data = stockage persistant de l'add-on (survit aux mises à jour).
+            ctx = pw.chromium.launch_persistent_context(
+                os.path.join("/data/profils", profil),
+                headless=True, args=args_chromium, **options_ctx)
+            nav = ctx                     # fermer le contexte ferme le tout
+        else:
+            nav = pw.chromium.launch(headless=True, args=args_chromium)
+            ctx = nav.new_context(**options_ctx)
         try:
 
             # ⚠️ ANTI-SSRF, 2e étage — indispensable et propre à /render.
@@ -545,12 +483,6 @@ class Handler(BaseHTTPRequestHandler):
                 # jetons longue durée). Dit aussi si Chromium est bien là.
                 "arch": platform.machine(),
                 "verbes": ["/fetch"] + (["/render"] if CFG["render_enabled"] else []),
-                # Le rendu est-il GRAPHIQUE (écran virtuel Xvfb) ou headless ?
-                # C'est ce qui décide du score reCAPTCHA, donc du 403 de Waze —
-                # et sans ça, la seule façon de le vérifier serait de taper sur
-                # Waze et d'interpréter un échec. Un déploiement doit se
-                # constater, pas se déduire.
-                "rendu_graphique": bool(os.environ.get("DISPLAY")),
             })
             return
 
