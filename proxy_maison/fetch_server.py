@@ -354,15 +354,21 @@ def _render(url: str, referer: str = "", attendre: str = "",
             # carte, un bouton) n'existe qu'une fois la page construite. 700 ms
             # entre deux clics = le temps d'animation d'un zoom Leaflet ; sans
             # ce répit, les clics s'empilent et la carte n'en applique qu'un.
-            if clic and not attente_ratee:
+            # On essaie même si l'attente a raté (la page peut être utilisable
+            # quand même) : chaque clic a son propre garde-fou de 5 s.
+            if clic:
                 for _ in range(max(1, min(clic_n, 15))):
                     try:
                         page.click(clic, timeout=5000)
                     except PWTimeout:
-                        break            # cible disparue : on rend ce qu'on a
+                        break            # cible absente : on rend ce qu'on a
                     page.wait_for_timeout(700)
-                try:                     # laisser les XHR déclenchés retomber
-                    page.wait_for_load_state("networkidle", timeout=ms)
+                # Laisser les XHR déclenchés retomber — BORNÉ à 8 s : une page
+                # qui réessaie en boucle (un 403 têtu) n'atteint jamais l'idle
+                # et gèlerait tout le render_timeout pour rien.
+                try:
+                    page.wait_for_load_state("networkidle",
+                                             timeout=min(ms, 8000))
                 except PWTimeout:
                     pass
 
