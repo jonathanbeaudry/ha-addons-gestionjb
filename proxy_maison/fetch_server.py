@@ -344,15 +344,22 @@ def _render(url: str, referer: str = "", attendre: str = "",
         if ua:                            # sur le moteur (Firefox ≠ Chromium)
             options_ctx["user_agent"] = ua
 
+        # Chromium GRAPHIQUE dès qu'un écran existe (Xvfb, monté par run.sh) :
+        # reCAPTCHA Enterprise note durement le headless, même le « nouveau ».
+        # Pas d'écran → headless quand même : un rendu moins discret vaut mieux
+        # que pas de rendu.
+        sans_tete = not os.environ.get("DISPLAY")
+
         def _lancer(**extra):
             """(à fermer, contexte). `extra` = options de lancement en plus."""
             if profil:
                 # /data = stockage persistant de l'add-on (survit aux MAJ).
                 c = pw.chromium.launch_persistent_context(
-                    os.path.join("/data/profils", profil), headless=True,
+                    os.path.join("/data/profils", profil), headless=sans_tete,
                     args=args_chromium, **extra, **options_ctx)
                 return c, c               # fermer le contexte ferme le tout
-            n = pw.chromium.launch(headless=True, args=args_chromium, **extra)
+            n = pw.chromium.launch(headless=sans_tete, args=args_chromium,
+                                   **extra)
             return n, n.new_context(**options_ctx)
 
         # channel="chromium" = le VRAI Chromium en « nouveau headless », plutôt
@@ -538,6 +545,12 @@ class Handler(BaseHTTPRequestHandler):
                 # jetons longue durée). Dit aussi si Chromium est bien là.
                 "arch": platform.machine(),
                 "verbes": ["/fetch"] + (["/render"] if CFG["render_enabled"] else []),
+                # Le rendu est-il GRAPHIQUE (écran virtuel Xvfb) ou headless ?
+                # C'est ce qui décide du score reCAPTCHA, donc du 403 de Waze —
+                # et sans ça, la seule façon de le vérifier serait de taper sur
+                # Waze et d'interpréter un échec. Un déploiement doit se
+                # constater, pas se déduire.
+                "rendu_graphique": bool(os.environ.get("DISPLAY")),
             })
             return
 

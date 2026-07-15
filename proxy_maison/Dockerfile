@@ -15,8 +15,14 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
 # (« Executable doesn't exist … downloaded by a different version »).
 # `--with-deps` tire les libs système de Chromium (fonts, nss, dbus…) — sans
 # elles il meurt au lancement.
+# xvfb : un écran virtuel, pour lancer Chromium en mode GRAPHIQUE sans écran.
+# Ce n'est pas un luxe — reCAPTCHA Enterprise note durement le mode « headless »
+# (même le « nouveau »), et c'est ce qui faisait refuser le jeton de Waze. Un
+# Chromium headed sous Xvfb est un vrai navigateur, avec son compositeur, son
+# GPU logiciel et ses vraies dimensions d'écran.
 RUN pip install --no-cache-dir playwright \
  && playwright install --with-deps chromium \
+ && apt-get update && apt-get install -y --no-install-recommends xvfb \
  && rm -rf /root/.cache/pip /var/lib/apt/lists/*
 
 COPY fetch_server.py /fetch_server.py
