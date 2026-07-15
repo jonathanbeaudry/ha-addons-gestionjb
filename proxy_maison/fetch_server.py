@@ -248,7 +248,7 @@ def _fetch(url: str, referer: str = "") -> tuple[int, bytes, str]:
 
 def _render(url: str, referer: str = "", attendre: str = "",
             selecteur: str = "", capture: str = "", clic: str = "",
-            clic_n: int = 1) -> dict:
+            clic_n: int = 1, profil: str = "") -> dict:
     """Ouvre `url` dans Chromium, laisse tourner le JS, rend le DOM final.
 
     Un navigateur NEUF par appel : plus lent (~1-3 s de démarrage) qu'un
@@ -265,6 +265,12 @@ def _render(url: str, referer: str = "", attendre: str = "",
     sélecteur CSS, puis laisser le réseau retomber. C'est ce qui permet de
     dézoomer une carte (le « − » de Waze) pour que la page refasse ses appels
     XHR sur une zone plus large — toujours SES appels, jamais un script à nous.
+
+    `profil` : nom ([a-z0-9_-]) → contexte PERSISTANT sous /data/profils/<nom>.
+    Les cookies survivent d'un appel à l'autre : pour les sites qui notent la
+    « fraîcheur » du navigateur (reCAPTCHA de Waze), une session habituée passe
+    là où un navigateur tout neuf se fait montrer la porte. Sans profil, on
+    garde le navigateur jetable — zéro état qui fuit entre deux appels.
     """
     # Import PARESSEUX : /fetch ne doit jamais dépendre de Chromium (voir le
     # docstring en tête). Un add-on sans navigateur sert encore /fetch.
@@ -276,20 +282,24 @@ def _render(url: str, referer: str = "", attendre: str = "",
     bloquees: list[str] = []
     _CACHE_HOTES.clear()
 
+    # Sans --no-sandbox, Chromium refuse de démarrer dans un conteneur
+    # d'add-on (pas de user namespaces). L'isolation ici, c'est le
+    # conteneur lui-même, pas le bac à sable de Chromium.
+    args_chromium = ["--no-sandbox", "--disable-dev-shm-usage"]
+    options_ctx = {"user_agent": BROWSER_UA, "locale": "fr-CA",
+                   "viewport": {"width": 1366, "height": 900}}
+
     with sync_playwright() as pw:
-        nav = pw.chromium.launch(
-            headless=True,
-            # Sans --no-sandbox, Chromium refuse de démarrer dans un conteneur
-            # d'add-on (pas de user namespaces). L'isolation ici, c'est le
-            # conteneur lui-même, pas le bac à sable de Chromium.
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        if profil:
+            # /data = stockage persistant de l'add-on (survit aux mises à jour).
+            ctx = pw.chromium.launch_persistent_context(
+                os.path.join("/data/profils", profil),
+                headless=True, args=args_chromium, **options_ctx)
+            nav = ctx                     # fermer le contexte ferme le tout
+        else:
+            nav = pw.chromium.launch(headless=True, args=args_chromium)
+            ctx = nav.new_context(**options_ctx)
         try:
-            ctx = nav.new_context(
-                user_agent=BROWSER_UA,
-                locale="fr-CA",
-                viewport={"width": 1366, "height": 900},
-            )
 
             # ⚠️ ANTI-SSRF, 2e étage — indispensable et propre à /render.
             # `_verrous()` ne valide que l'URL DEMANDÉE. Une fois la page
@@ -501,6 +511,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         target, referer = verrouille
 
+        # `profil` finit dans un chemin sous /data : liste blanche stricte,
+        # jamais le texte reçu tel quel.
+        profil = (qs.get("profil") or [""])[0]
+        if profil and not re.fullmatch(r"[a-z0-9_-]{1,32}", profil):
+            self._json(400, {"error": "profil invalide ([a-z0-9_-]{1,32})"})
+            return
+
         try:
             clic_n = (qs.get("clic_n") or ["1"])[0]
             res = _render(
@@ -511,6 +528,7 @@ class Handler(BaseHTTPRequestHandler):
                 capture=(qs.get("capture") or [""])[0],
                 clic=(qs.get("clic") or [""])[0],
                 clic_n=int(clic_n) if clic_n.isdigit() else 1,
+                profil=profil,
             )
         except ImportError as e:
             # Chromium absent de l'image : /fetch marche encore, on le dit sans
