@@ -194,7 +194,8 @@ def _solve_challenge(html: str, opener: urllib.request.OpenerDirector) -> None:
 
 
 def _browser_get(url: str, opener, accept: str,
-                 referer: str = "") -> tuple[int, bytes, str]:
+                 referer: str = "", extra: dict | None = None
+                 ) -> tuple[int, bytes, str]:
     """GET « navigateur ». Renvoie (status, corps, content_type)."""
     entetes = {
         "User-Agent": BROWSER_UA,
@@ -205,6 +206,11 @@ def _browser_get(url: str, opener, accept: str,
     # sans Referer de leur propre site, même d'une IP résidentielle.
     if referer:
         entetes["Referer"] = referer
+    # En-têtes sur mesure du VPS (jeton rejoué, Accept exotique…) — après les
+    # nôtres, donc ils gagnent. Host et Content-Length restent à urllib.
+    for cle, val in (extra or {}).items():
+        if cle.lower() not in ("host", "content-length", "connection"):
+            entetes[cle] = val
     req = urllib.request.Request(url, headers=entetes)
     try:
         with opener.open(req, timeout=CFG["timeout"]) as resp:
@@ -215,7 +221,8 @@ def _browser_get(url: str, opener, accept: str,
         return e.code, e.read(CFG["max_bytes"] + 1), e.headers.get("Content-Type", "")
 
 
-def _fetch(url: str, referer: str = "") -> tuple[int, bytes, str]:
+def _fetch(url: str, referer: str = "",
+           extra: dict | None = None) -> tuple[int, bytes, str]:
     """Récupère l'URL. Gère le défi Reddit (warm-up HTML puis .json, même jar)."""
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -234,12 +241,12 @@ def _fetch(url: str, referer: str = "") -> tuple[int, bytes, str]:
         if "js_challenge" in page_txt or "e=>e+e" in page_txt:
             _solve_challenge(page_txt, opener)
         return _browser_get(url, opener, "application/json, text/plain, */*",
-                            referer)
+                            referer, extra)
 
     return _browser_get(
         url, opener,
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        referer)
+        referer, extra)
 
 
 # --------------------------------------------------------------------------- #
@@ -327,7 +334,13 @@ def _render(url: str, referer: str = "", attendre: str = "",
                     if capture not in rep.url:
                         return
                     entree = {"url": rep.url, "status": rep.status,
-                              "headers": dict(rep.headers)}
+                              "headers": dict(rep.headers),
+                              # En-têtes de la REQUÊTE aussi : c'est là que
+                              # vivent les jetons négociés par la page
+                              # (X-Recaptcha-Token de Waze) — capturés pour
+                              # pouvoir REJOUER l'appel avec d'autres
+                              # paramètres tant que le jeton vit.
+                              "request_headers": dict(rep.request.headers)}
                     try:
                         corps = rep.body()
                         entree["body"] = corps[:CFG["max_bytes"]].decode(
@@ -480,8 +493,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         target, referer = verrouille
 
+        # En-têtes sur mesure (JSON) : rejouer un appel capturé par /render
+        # avec son jeton (X-Recaptcha-Token de Waze) mais d'autres paramètres.
+        extra = None
+        brut = (qs.get("headers") or [""])[0]
+        if brut:
+            try:
+                extra = json.loads(brut)
+                assert isinstance(extra, dict)
+                extra = {str(k): str(v) for k, v in extra.items()}
+            except (json.JSONDecodeError, AssertionError):
+                self._json(400, {"error": "headers doit être un objet JSON"})
+                return
+
         try:
-            status, body, ctype = _fetch(target, referer)
+            status, body, ctype = _fetch(target, referer, extra)
         except Exception as e:  # noqa: BLE001 - renvoyer une erreur propre au VPS
             self._json(502, {"error": f"échec fetch: {type(e).__name__}: {e}"})
             return
