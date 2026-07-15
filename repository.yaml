@@ -1,0 +1,16 @@
+# Métadonnées du DÉPÔT d'add-ons (pas d'un add-on).
+# Ce fichier va à la RACINE du repo public ; chaque add-on vit dans son
+# sous-dossier (proxy_maison/…).
+#
+# Pourquoi un dépôt plutôt qu'un add-on local : un add-on local se met à jour en
+# recollant les fichiers à la main dans `nano` (~15 min, à refaire chaque fois).
+# Avec un dépôt, on pousse et Home Assistant offre « Mettre à jour ».
+#
+# ⚠️ Ce repo est PUBLIC. Rien de personnel ni de secret ne doit s'y rendre : ni
+# jeton (c'est une *option* d'add-on, stockée dans /data/options.json sur la
+# machine maison), ni hostname réel, ni nom, ni détail du matériel. Le code de
+# l'add-on est un logiciel GÉNÉRIQUE — tout le contexte perso vit dans le README
+# du repo privé, qui n'est pas publié.
+name: Add-ons maison
+url: https://github.com/jonathanbeaudry/ha-addons-gestionjb
+maintainer: gestionjb

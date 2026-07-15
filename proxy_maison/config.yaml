@@ -1,0 +1,44 @@
+# Add-on Home Assistant — « Proxy maison »
+# Installé depuis le dépôt public : Paramètres → Modules → Boutique → (⋮) →
+# Dépôts → https://github.com/<compte>/ha-addons-gestionjb
+# (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
+# remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
+name: Proxy maison (sortie résidentielle)
+version: "2.0.0"
+slug: proxy_maison
+description: >-
+  Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
+  (contourne les blocages d'IP centre de données). /fetch = HTML brut,
+  /render = la page avec son JavaScript exécuté (Chromium). Verrouillé par
+  jeton + liste blanche + blocage des IP privées.
+# armv7 retiré en 2.0.0 : pas de build officiel de Chromium pour cette arch.
+arch:
+  - aarch64
+  - amd64
+# Réseau hôte : le port 8099 est ouvert directement sur l'hôte, ce qui rend le
+# service joignable par l'add-on Cloudflared (via l'IP LAN de la machine).
+host_network: true
+init: false
+options:
+  token: ""
+  allowlist:
+    - reddit.com
+    - morningstar.com
+  # true = n'importe quel lien passe (la liste blanche ci-dessus devient un
+  # simple repli inutile). L'anti-SSRF reste TOUJOURS actif : les IP privées /
+  # loopback / réservées restent bloquées, donc le proxy ne peut jamais servir à
+  # atteindre le réseau maison, egress général ou pas.
+  general_egress: true
+  port: 8099
+  # Coupe-circuit de Chromium. Si /render fait des siennes, le mettre à false
+  # laisse /fetch (la production : Reddit, Morningstar) debout.
+  render_enabled: true
+  render_timeout: 45
+schema:
+  token: str
+  allowlist:
+    - str
+  general_egress: bool
+  port: port
+  render_enabled: bool
+  render_timeout: int(5,180)
