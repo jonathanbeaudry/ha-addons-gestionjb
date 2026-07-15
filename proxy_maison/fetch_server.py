@@ -247,7 +247,8 @@ def _fetch(url: str, referer: str = "") -> tuple[int, bytes, str]:
 # --------------------------------------------------------------------------- #
 
 def _render(url: str, referer: str = "", attendre: str = "",
-            selecteur: str = "", capture: str = "") -> dict:
+            selecteur: str = "", capture: str = "", clic: str = "",
+            clic_n: int = 1) -> dict:
     """Ouvre `url` dans Chromium, laisse tourner le JS, rend le DOM final.
 
     Un navigateur NEUF par appel : plus lent (~1-3 s de démarrage) qu'un
@@ -259,6 +260,11 @@ def _render(url: str, referer: str = "", attendre: str = "",
     contient ce motif sont retenues et renvoyées. C'est ce qui permet de lire
     l'appel XHR que la page fait elle-même, jetons d'en-tête inclus, sans jamais
     exécuter de script fourni par le VPS.
+
+    `clic` + `clic_n` : APRÈS l'attente, cliquer `clic_n` fois (max 15) sur ce
+    sélecteur CSS, puis laisser le réseau retomber. C'est ce qui permet de
+    dézoomer une carte (le « − » de Waze) pour que la page refasse ses appels
+    XHR sur une zone plus large — toujours SES appels, jamais un script à nous.
     """
     # Import PARESSEUX : /fetch ne doit jamais dépendre de Chromium (voir le
     # docstring en tête). Un add-on sans navigateur sert encore /fetch.
@@ -331,6 +337,7 @@ def _render(url: str, referer: str = "", attendre: str = "",
 
             # « Fini de charger » n'existe pas vraiment sur une page moderne :
             # on laisse le choix au VPS plutôt que de deviner.
+            attente_ratee = False
             try:
                 if selecteur:
                     page.wait_for_selector(selecteur, timeout=ms)
@@ -341,14 +348,27 @@ def _render(url: str, referer: str = "", attendre: str = "",
             except PWTimeout:
                 # L'attente rate ≠ la page est inutile : on rend ce qu'on a, en
                 # le disant. Au VPS de juger.
-                return {"ok": True, "status": statut, "url": page.url,
-                        "html": page.content()[:CFG["max_bytes"]],
-                        "captures": captees, "attente_ratee": True,
-                        "hotes_bloques": bloquees}
+                attente_ratee = True
+
+            # Les clics viennent APRÈS l'attente : la cible (un contrôle de
+            # carte, un bouton) n'existe qu'une fois la page construite. 700 ms
+            # entre deux clics = le temps d'animation d'un zoom Leaflet ; sans
+            # ce répit, les clics s'empilent et la carte n'en applique qu'un.
+            if clic and not attente_ratee:
+                for _ in range(max(1, min(clic_n, 15))):
+                    try:
+                        page.click(clic, timeout=5000)
+                    except PWTimeout:
+                        break            # cible disparue : on rend ce qu'on a
+                    page.wait_for_timeout(700)
+                try:                     # laisser les XHR déclenchés retomber
+                    page.wait_for_load_state("networkidle", timeout=ms)
+                except PWTimeout:
+                    pass
 
             return {"ok": True, "status": statut, "url": page.url,
                     "html": page.content()[:CFG["max_bytes"]],
-                    "captures": captees, "attente_ratee": False,
+                    "captures": captees, "attente_ratee": attente_ratee,
                     # Remonté au VPS : une page amputée de ressources bloquées
                     # doit être explicable, jamais un mystère silencieux.
                     "hotes_bloques": bloquees}
@@ -361,7 +381,7 @@ def _render(url: str, referer: str = "", attendre: str = "",
 # --------------------------------------------------------------------------- #
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ProxyMaison/2.0"
+    server_version = "ProxyMaison/2.1"
 
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -476,12 +496,15 @@ class Handler(BaseHTTPRequestHandler):
         target, referer = verrouille
 
         try:
+            clic_n = (qs.get("clic_n") or ["1"])[0]
             res = _render(
                 target,
                 referer=referer,
                 attendre=(qs.get("wait") or [""])[0],
                 selecteur=(qs.get("selector") or [""])[0],
                 capture=(qs.get("capture") or [""])[0],
+                clic=(qs.get("clic") or [""])[0],
+                clic_n=int(clic_n) if clic_n.isdigit() else 1,
             )
         except ImportError as e:
             # Chromium absent de l'image : /fetch marche encore, on le dit sans
