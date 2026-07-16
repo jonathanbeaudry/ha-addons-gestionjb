@@ -56,17 +56,74 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SERVICE_VERSION = "2.0.0"
 
-# UA « navigateur » pour que les sites servent une page normale, pas un blocage API.
+# UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
+# servent une page normale, pas un blocage API. NON utilisé par /render depuis la
+# 2.7.0 — /render présente désormais un vrai Chrome avec sa propre identité (voir
+# `_ouvrir_navigateur`).
 #
-# Oui, il annonce Firefox alors que /render est un Chromium — et non, ce n'est
-# PAS ce qui bloque Waze : la config qui a sorti 32 754 o de vraies alertes le
-# 2026-07-15 était exactement celle-ci. Vérifié en la « corrigeant » (UA Chrome
-# cohérent + navigateur graphique) : 0 succès sur 7 essais. Ne pas refaire ce
-# détour — le vrai levier est le NOMBRE d'appels, pas le déguisement.
+# ⚠️ Historique à ne pas oublier : un essai du 2026-07-15 « UA Chrome cohérent +
+# navigateur graphique » a fait 0/7, d'où l'ancien verdict « le levier c'est le
+# NOMBRE d'appels, pas le déguisement ». MAIS le test décisif du 2026-07-16 (le
+# cell de Jonathan, vrai Chrome, SUR LA MÊME IP maison, passe pendant que le
+# Chromium headless se fait jeter) prouve que l'empreinte COMPTE. Réconciliation :
+# le 15, l'essai « corrigé » était (a) partiel — pas de vrai Chrome, pas de patch
+# webdriver, pas d'écran, pas de stealth — et (b) probablement fait pendant que
+# l'IP était déjà en pénitence (bloquée quoi qu'il arrive). La 2.7.0 empile la
+# version COMPLÈTE. Reste à vérifier UNE fois, hors pénitence.
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
     "Gecko/20100101 Firefox/140.0"
 )
+
+# Petits patchs JS injectés AVANT tout chargement de page (add_init_script) pour
+# gommer les « tells » qu'un moteur d'automatisation laisse et que reCAPTCHA
+# Enterprise lit. C'est ce que fait aussi la lib playwright-stealth ; on le garde
+# à la main comme socle FIABLE (la lib change d'API selon les versions). Usage
+# perso, 1-2x/jour, affichage de données publiques — pas d'évasion de sécurité.
+_STEALTH_JS = r"""
+(() => {
+  // 1) navigator.webdriver : le drapeau nº1 que lit reCAPTCHA (true = piloté).
+  try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch (e) {}
+  // 2) Un headless annonce 0 plugin ; un vrai navigateur en a. On en simule.
+  try { Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]}); } catch (e) {}
+  // 3) window.chrome : présent sur un vrai Chrome, absent en automation nue.
+  try { if (!window.chrome) { window.chrome = { runtime: {} }; } } catch (e) {}
+  // 4) permissions.query « notifications » : un headless répond de façon
+  //    incohérente (denied alors que Notification.permission dit default).
+  try {
+    const q = window.navigator.permissions.query;
+    window.navigator.permissions.query = (p) => (
+      p && p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : q(p)
+    );
+  } catch (e) {}
+  // 5) Langues cohérentes avec la locale fr-CA du contexte.
+  try { Object.defineProperty(navigator, 'languages', {get: () => ['fr-CA', 'fr', 'en-US', 'en']}); } catch (e) {}
+})();
+"""
+
+
+def _stealth_lib(ctx, page) -> None:
+    """Applique playwright-stealth s'il est installé — best-effort, JAMAIS fatal.
+    L'API a changé entre versions (v2 = classe `Stealth` sur le contexte ; v1 =
+    `stealth_sync(page)`). On tente les deux et on avale toute erreur : le socle
+    `_STEALTH_JS` (add_init_script) reste le garant. « Fait les 3 » = ceci EN PLUS
+    du Chrome graphique et des patchs maison, pas à leur place."""
+    try:
+        from playwright_stealth import Stealth  # v2.x
+        try:
+            Stealth().apply_stealth_sync(ctx)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001 - lib absente ou API différente
+        pass
+    try:
+        from playwright_stealth import stealth_sync  # v1.x (par page)
+        stealth_sync(page)
+    except Exception:  # noqa: BLE001
+        pass
 
 # --------------------------------------------------------------------------- #
 # Configuration (lue depuis /data/options.json en add-on HA, ou l'environnement)
@@ -295,24 +352,61 @@ def _render(url: str, referer: str = "", attendre: str = "",
     bloquees: list[str] = []
     _CACHE_HOTES.clear()
 
-    # Sans --no-sandbox, Chromium refuse de démarrer dans un conteneur
-    # d'add-on (pas de user namespaces). L'isolation ici, c'est le
-    # conteneur lui-même, pas le bac à sable de Chromium.
-    args_chromium = ["--no-sandbox", "--disable-dev-shm-usage"]
-    options_ctx = {"user_agent": BROWSER_UA, "locale": "fr-CA",
-                   "viewport": {"width": 1366, "height": 900}}
+    # Sans --no-sandbox, Chromium/Chrome refuse de démarrer dans un conteneur
+    # d'add-on (pas de user namespaces). L'isolation ici, c'est le conteneur
+    # lui-même. --disable-blink-features=AutomationControlled éteint côté moteur
+    # le drapeau navigator.webdriver que reCAPTCHA lit.
+    args_nav = ["--no-sandbox", "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"]
 
-    with sync_playwright() as pw:
+    def _ouvrir(pw):
+        """(nav, ctx, mode). Voie 1 = vrai Chrome + écran (xvfb) : l'identité
+        d'un visiteur normal pour que reCAPTCHA Enterprise NOTE « humain » et
+        laisse passer georss (note en tête + mémoire waze-usage-perso). Voie 2
+        (repli) = Chromium headless d'origine — pour que /render ne meure JAMAIS
+        si Chrome ou l'écran virtuel manquent dans l'image."""
+        # DISPLAY présent = run.sh a lancé xvfb → on peut faire du graphique.
+        if os.environ.get("DISPLAY"):
+            try:
+                opts = {"locale": "fr-CA",
+                        "viewport": {"width": 1366, "height": 900}}
+                # Pas de user_agent forcé : un vrai Chrome présente SON UA et ses
+                # client-hints cohérents — moins « menteur » qu'un UA plaqué.
+                base = dict(headless=False, channel="chrome", args=args_nav,
+                            ignore_default_args=["--enable-automation"])
+                if profil:
+                    # Profils Chrome à part : un dossier écrit par Chromium puis
+                    # rouvert par Chrome peut coincer. On repart propre.
+                    c = pw.chromium.launch_persistent_context(
+                        os.path.join("/data/profils_chrome", profil),
+                        **base, **opts)
+                    return c, c, "chrome-graphique"
+                n = pw.chromium.launch(**base)
+                return n, n.new_context(**opts), "chrome-graphique"
+            except Exception as e:  # noqa: BLE001 - Chrome/xvfb absent → repli
+                print(f"[render] Chrome graphique indisponible "
+                      f"({type(e).__name__}: {e}) — repli Chromium headless",
+                      file=sys.stderr)
+        # Voie 2 : l'ancien comportement — UA Firefox plaqué, headless.
+        opts = {"user_agent": BROWSER_UA, "locale": "fr-CA",
+                "viewport": {"width": 1366, "height": 900}}
         if profil:
             # /data = stockage persistant de l'add-on (survit aux mises à jour).
-            ctx = pw.chromium.launch_persistent_context(
+            c = pw.chromium.launch_persistent_context(
                 os.path.join("/data/profils", profil),
-                headless=True, args=args_chromium, **options_ctx)
-            nav = ctx                     # fermer le contexte ferme le tout
-        else:
-            nav = pw.chromium.launch(headless=True, args=args_chromium)
-            ctx = nav.new_context(**options_ctx)
+                headless=True, args=args_nav, **opts)
+            return c, c, "chromium-headless"
+        n = pw.chromium.launch(headless=True, args=args_nav)
+        return n, n.new_context(**opts), "chromium-headless"
+
+    with sync_playwright() as pw:
+        nav, ctx, mode_nav = _ouvrir(pw)
         try:
+            # Socle stealth : injecté AVANT toute navigation, sur chaque page.
+            try:
+                ctx.add_init_script(_STEALTH_JS)
+            except Exception:  # noqa: BLE001
+                pass
 
             # ⚠️ ANTI-SSRF, 2e étage — indispensable et propre à /render.
             # `_verrous()` ne valide que l'URL DEMANDÉE. Une fois la page
@@ -334,6 +428,9 @@ def _render(url: str, referer: str = "", attendre: str = "",
 
             ctx.route("**/*", _garde)
             page = ctx.new_page()
+            # playwright-stealth EN PLUS du socle maison (best-effort, jamais
+            # fatal) — la 3ᵉ couche de « fait les 3 ».
+            _stealth_lib(ctx, page)
 
             if capture:
                 def _sur_reponse(rep) -> None:
@@ -404,6 +501,9 @@ def _render(url: str, referer: str = "", attendre: str = "",
             return {"ok": True, "status": statut, "url": page.url,
                     "html": page.content()[:CFG["max_bytes"]],
                     "captures": captees, "attente_ratee": attente_ratee,
+                    # Quelle voie a servi (chrome-graphique / chromium-headless) :
+                    # au VPS de savoir si l'humanisation a bien pris, sans deviner.
+                    "navigateur": mode_nav,
                     # Remonté au VPS : une page amputée de ressources bloquées
                     # doit être explicable, jamais un mystère silencieux.
                     "hotes_bloques": bloquees}

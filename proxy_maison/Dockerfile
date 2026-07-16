@@ -13,10 +13,24 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
 # Version NON épinglée volontairement : le paquet `playwright` et son navigateur
 # doivent venir de la même install, sinon Playwright refuse de démarrer
 # (« Executable doesn't exist … downloaded by a different version »).
-# `--with-deps` tire les libs système de Chromium (fonts, nss, dbus…) — sans
-# elles il meurt au lancement.
-RUN pip install --no-cache-dir playwright \
+# `--with-deps` tire les libs système (fonts, nss, dbus…) — sans elles il meurt.
+#
+# On installe DEUX navigateurs :
+#   - `chromium`  : repli headless d'origine (voie 2 de _ouvrir), toujours là.
+#   - `chrome`    : le VRAI Google Chrome (channel="chrome", voie 1) — son
+#                   empreinte « visiteur normal » est ce qui vise à passer le
+#                   score reCAPTCHA de Waze. Va dans /opt/google/chrome (paquet
+#                   système), pas /ms-playwright.
+# playwright-stealth : patchs d'empreinte supplémentaires (best-effort côté code).
+# xvfb : écran virtuel pour lancer Chrome GRAPHIQUE (headless=False) sans écran
+#        physique — un navigateur headless se fait flaguer « robot ».
+# (+~350 Mo pour Chrome + xvfb ; la machine maison a 364 Go de libre.)
+RUN pip install --no-cache-dir playwright playwright-stealth \
  && playwright install --with-deps chromium \
+ && ( playwright install --with-deps chrome \
+      || echo "[build] Google Chrome indisponible — /render retombera en Chromium headless" ) \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends xvfb \
  && rm -rf /root/.cache/pip /var/lib/apt/lists/*
 
 COPY fetch_server.py /fetch_server.py
