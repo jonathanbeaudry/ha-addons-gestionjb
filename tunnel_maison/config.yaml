@@ -1,0 +1,47 @@
+# Add-on Home Assistant — « Tunnel maison »
+# Installé depuis le même dépôt public que « Proxy maison » :
+# Paramètres → Modules → Boutique → (⋮) → Dépôts → ha-addons-gestionjb
+#
+# Volontairement SÉPARÉ du proxy maison : celui-là porte la juste valeur
+# Morningstar (/render) et Waze. On ne greffe pas un tunnel expérimental sur un
+# service dont dépend la production — si le tunnel tombe, /fetch reste debout.
+name: Tunnel maison (sortie résidentielle TCP)
+version: "1.0.0"
+slug: tunnel_maison
+description: >-
+  Relaie du TCP dans un WebSocket pour que le VPS sorte par l'IP résidentielle
+  de la maison, SANS ouvrir de port sur le VPS (tout passe par Cloudflare).
+  Sert à `agy` (Gemini Code Assist), bloqué parce que le VPS est en France.
+  Verrouillé par jeton, liste blanche de destinations, ports et anti-SSRF.
+arch:
+  - aarch64
+  - amd64
+  - armv7
+# Réseau hôte : le port est joignable par l'add-on Cloudflared via l'IP LAN,
+# exactement comme le proxy maison en 8099.
+host_network: true
+init: false
+options:
+  # Vide = le tunnel REFUSE tout. À coller depuis l'UI (même valeur que
+  # ~/.config/ibkr/tunnel_maison.json côté VPS).
+  token: ""
+  # Strictement ce dont `agy` a besoin. Ce n'est PAS un proxy ouvert.
+  allowlist:
+    - googleapis.com
+    - google.com
+    - gstatic.com
+    - googleusercontent.com
+  ports:
+    - 443
+  port: 8100
+  max_connexions: 24
+  log_level: info
+schema:
+  token: str
+  allowlist:
+    - str
+  ports:
+    - port
+  port: port
+  max_connexions: int(1,256)
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
