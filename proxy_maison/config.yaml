@@ -4,7 +4,7 @@
 # (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
 # remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
 name: Proxy maison (sortie résidentielle)
-version: "2.8.0"
+version: "2.9.0"
 slug: proxy_maison
 description: >-
   Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
@@ -34,16 +34,17 @@ options:
   # laisse /fetch (la production : Reddit, Morningstar) debout.
   render_enabled: true
   render_timeout: 45
-  # /chatgpt_demarre (2.8.0) : le VPS dit « vas-y » une fois par jour, l'add-on
-  # tape chatgpt_message dans chatgpt_conversation. Conversation vide = verbe
-  # fermé. Les témoins = export JSON de l'extension Cookie-Editor sur
-  # chatgpt.com, depuis ton propre Chrome connecté. Le texte et la cible ne
-  # viennent JAMAIS du VPS.
+  # /navigateur_dire (2.9.0) : le VPS envoie une phrase à ChatGPT ou à Grok,
+  # dans LA conversation réglée ici (jamais choisie par le VPS). Conversation
+  # vide = service fermé. Les témoins = export JSON de l'extension
+  # Cookie-Editor, depuis ton propre Chrome connecté au site.
   chatgpt_conversation: ""
   chatgpt_message: "fait prochaine sur le mcp carcajou"
   chatgpt_cookies: ""
-  chatgpt_intervalle_min: 60
-  chatgpt_garder_min: 120
+  grok_conversation: "https://grok.com/"
+  grok_cookies: ""
+  navigateur_max_par_jour: 30
+  navigateur_garder_min: 120
 schema:
   token: str
   allowlist:
@@ -55,5 +56,8 @@ schema:
   chatgpt_conversation: str?
   chatgpt_message: str?
   chatgpt_cookies: password?
-  chatgpt_intervalle_min: int(0,1440)
-  chatgpt_garder_min: int(1,600)
+  grok_conversation: str?
+  grok_message: str?
+  grok_cookies: password?
+  navigateur_max_par_jour: int(1,200)
+  navigateur_garder_min: int(1,600)

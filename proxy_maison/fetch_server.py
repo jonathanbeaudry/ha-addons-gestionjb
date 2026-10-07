@@ -148,12 +148,16 @@ def _charger_config() -> dict:
         "render_enabled": os.environ.get("RENDER_ENABLED", "true").lower()
         not in ("0", "false", "no"),
         "render_timeout": int(os.environ.get("RENDER_TIMEOUT", "45")),
-        # /chatgpt_demarre — voir la section du même nom. Vide = verbe fermé.
+        # /navigateur_dire — voir la section du même nom. Conversation vide =
+        # service fermé.
         "chatgpt_conversation": "",
         "chatgpt_message": "fait prochaine sur le mcp carcajou",
         "chatgpt_cookies": "",
-        "chatgpt_intervalle_min": 60,
-        "chatgpt_garder_min": 120,
+        "grok_conversation": "https://grok.com/",
+        "grok_message": "",
+        "grok_cookies": "",
+        "navigateur_max_par_jour": 30,
+        "navigateur_garder_min": 120,
     }
     env_allow = os.environ.get("ALLOWLIST", "")
     if env_allow:
@@ -178,10 +182,11 @@ def _charger_config() -> dict:
             if opts.get("render_timeout"):
                 cfg["render_timeout"] = int(opts["render_timeout"])
             for cle in ("chatgpt_conversation", "chatgpt_message",
-                        "chatgpt_cookies"):
+                        "chatgpt_cookies", "grok_conversation",
+                        "grok_message", "grok_cookies"):
                 if opts.get(cle):
                     cfg[cle] = str(opts[cle]).strip()
-            for cle in ("chatgpt_intervalle_min", "chatgpt_garder_min"):
+            for cle in ("navigateur_max_par_jour", "navigateur_garder_min"):
                 if opts.get(cle) is not None:
                     cfg[cle] = int(opts[cle])
         except (OSError, ValueError, json.JSONDecodeError) as e:
@@ -331,7 +336,7 @@ def _fetch(url: str, referer: str = "",
 
 
 # --------------------------------------------------------------------------- #
-# Le navigateur — partagé par /render et /chatgpt_demarre
+# Le navigateur — partagé par /render et /navigateur_dire
 # --------------------------------------------------------------------------- #
 
 # Sans --no-sandbox, Chromium/Chrome refuse de démarrer dans un conteneur
@@ -389,7 +394,7 @@ def _garder_anti_ssrf(ctx, bloquees: list) -> None:
     ELLE qui décide quoi charger : images, XHR, iframes, redirections. Un site
     hostile pourrait donc faire tâter 192.168.x à Chromium — un trou qui
     n'existe pas avec /fetch. Ici chaque requête du navigateur est vérifiée,
-    pas juste la première. Partagé par /render et /chatgpt_demarre."""
+    pas juste la première. Partagé par /render et /navigateur_dire."""
     def _garde(route, requete) -> None:
         hote = urllib.parse.urlparse(requete.url).hostname or ""
         if hote and not _hote_sur_pour_navigateur(hote):
@@ -539,64 +544,86 @@ def _render(url: str, referer: str = "", attendre: str = "",
 
 
 # --------------------------------------------------------------------------- #
-# /chatgpt_demarre — taper LA phrase dans LA conversation ChatGPT de Jonathan
+# /navigateur_dire et /navigateur_lire — parler à ChatGPT ou à Grok
 # --------------------------------------------------------------------------- #
 #
-# Demandé par Jonathan le 2026-10-07 : les tâches planifiées de ChatGPT ne
-# démarrent pas son travail ; il devait écrire lui-même, chaque jour,
-# « fait prochaine sur le mcp carcajou ». Ce verbe le fait à sa place, UNE fois
-# par jour (le rythme est décidé par le VPS, borné ici par un intervalle
-# minimal).
+# Jonathan, 2026-10-07 :
+#  1. « fait prochaine sur le mcp carcajou » tapé chaque jour dans sa
+#     conversation ChatGPT (les tâches planifiées de ChatGPT ne le font pas) ;
+#  2. puis, le même jour : « fais gérer Grok aussi et permets que ce soit toi
+#     [Ti-Coq] qui lances une phrase d'ici ».
 #
-# ⚠️ Le VPS ne fournit NI le texte NI la conversation : les deux sont des
-# OPTIONS de l'add-on, réglées par Jonathan dans HA. Le VPS ne peut que dire
-# « vas-y ». Accepter un texte venu du VPS ferait de ce verbe une porte pour
-# faire dire n'importe quoi à son ChatGPT — même raison que l'absence de
-# `?script=`.
+# Ce que le VPS peut choisir : le SERVICE (liste fermée ci-dessous) et le
+# TEXTE. Ce qu'il ne choisit JAMAIS : la conversation (option de l'add-on) ni
+# le compte (témoins collés en option par Jonathan). Le texte libre est un
+# geste explicite de Jonathan ; avant lui, seul le texte en option partait.
 #
-# ⚠️ Conditions d'utilisation : OpenAI n'autorise pas le pilotage de son site
-# par un robot. Jonathan l'a su avant de trancher (2026-10-07) ; c'est son
-# compte, une phrase par jour. Ne PAS en faire une boucle : l'intervalle
-# minimal est là pour ça.
+# ⚠️ Conditions d'utilisation : OpenAI et xAI n'autorisent pas le pilotage de
+# leur site par un robot. Jonathan l'a su avant de trancher (2026-10-07) ; ce
+# sont ses comptes. Le plafond `navigateur_max_par_jour` existe pour que ça
+# reste un usage d'humain, jamais une boucle.
 #
-# La connexion : un profil Chrome PERSISTANT (`chatgpt`) sous /data. Il est
-# amorcé par les témoins de connexion que Jonathan exporte de son propre Chrome
-# (extension Cookie-Editor → Export JSON) et colle dans l'option
-# `chatgpt_cookies`. Ils ne sont réinjectés que quand l'option CHANGE : sinon
-# on écraserait la session que le profil a rafraîchie lui-même.
+# La connexion : un profil Chrome PERSISTANT par service sous /data, amorcé par
+# les témoins exportés de SON Chrome (extension Cookie-Editor → Export JSON) et
+# collés dans `<service>_cookies`. Réinjectés seulement quand l'option CHANGE :
+# sinon on écraserait la session que le profil a rafraîchie lui-même.
 
-CHATGPT_ETAT = "/data/chatgpt_demarre.json"
-_CHATGPT_VERROU = threading.Lock()
+NAV_DIR = "/data"
+NAV_JOURNAL = os.path.join(NAV_DIR, "navigateur_journal.jsonl")
+TEXTE_MAX = 4000
 
-# Les sélecteurs de chatgpt.com — en un seul endroit : le jour où le site
+# Les sélecteurs de chaque site — en un seul endroit : le jour où un site
 # change, c'est ici qu'on regarde, et l'échec le dit (capture d'écran rendue).
-SEL_COMPOSEUR = "#prompt-textarea"
-SEL_ENVOYER = '[data-testid="send-button"], #composer-submit-button'
-SEL_ARRETER = '[data-testid="stop-button"]'
-SEL_MSG_USAGER = '[data-message-author-role="user"]'
-SEL_CONNEXION = '[data-testid="login-button"]'
+SERVICES = {
+    "chatgpt": {
+        "hotes": ("chatgpt.com", "www.chatgpt.com"),
+        "domaines_cookies": ("chatgpt.com", "openai.com"),
+        "composeur": "#prompt-textarea",
+        "envoyer": '[data-testid="send-button"], #composer-submit-button',
+        "arreter": '[data-testid="stop-button"]',
+        # La dernière réponse a un conteneur à elle ; sinon, repli générique.
+        "reponses": '[data-message-author-role="assistant"]',
+        "saisie": "",
+        "connexion": '[data-testid="login-button"]',
+    },
+    "grok": {
+        "hotes": ("grok.com", "www.grok.com"),
+        "domaines_cookies": ("grok.com", "x.ai"),
+        "composeur": 'form[data-composer="true"] textarea',
+        "envoyer": 'form[data-composer="true"] button[type="submit"]',
+        "arreter": ('form[data-composer="true"] button[aria-label*="Arrêter"], '
+                    'form[data-composer="true"] button[aria-label*="Stop"]'),
+        "reponses": "",
+        # Repli générique : la zone de saisie est retirée du texte lu, sinon
+        # ses libellés (« Envoyer »…) finissent collés à la réponse.
+        "saisie": 'form[data-composer="true"]',
+        "connexion": 'a[href*="sign-in"]',
+    },
+}
+
+_VERROUS = {s: threading.Lock() for s in SERVICES}
+_DERNIERE: dict = {}          # service -> dernier état connu de l'échange
 
 
-def conversation_valide(url: str) -> bool:
-    """Une conversation chatgpt.com, rien d'autre (https, hôte exact)."""
+def conversation_valide(service: str, url: str) -> bool:
+    """Une page du site du service, en https, hôte exact — rien d'autre."""
     p = urllib.parse.urlparse(url or "")
-    return (p.scheme == "https" and p.hostname in ("chatgpt.com", "www.chatgpt.com")
-            and len(p.path) > 1)
+    return p.scheme == "https" and p.hostname in SERVICES[service]["hotes"]
 
 
-def cookies_pour_playwright(brut: str) -> list[dict]:
+def cookies_pour_playwright(brut: str, domaines: tuple) -> list[dict]:
     """Export Cookie-Editor (liste JSON, ou {"cookies": [...]}) → format
-    Playwright. Seuls les témoins de chatgpt.com / openai.com passent : un
-    export trop large ne doit pas semer d'autres sessions dans ce profil.
-    Lève ValueError si l'export est illisible ou vide."""
+    Playwright. Seuls les témoins des `domaines` passent : un export trop
+    large ne doit pas semer d'autres sessions dans ce profil. Lève ValueError
+    si l'export est illisible ou ne contient rien d'utile."""
     try:
         data = json.loads(brut)
     except json.JSONDecodeError as e:
-        raise ValueError(f"chatgpt_cookies n'est pas du JSON : {e}") from e
+        raise ValueError(f"témoins illisibles (pas du JSON) : {e}") from e
     if isinstance(data, dict):
         data = data.get("cookies", [])
     if not isinstance(data, list):
-        raise ValueError("chatgpt_cookies doit être une liste de témoins")
+        raise ValueError("les témoins doivent être une liste")
     sites = {"no_restriction": "None", "none": "None", "lax": "Lax",
              "strict": "Strict"}
     sortie = []
@@ -605,8 +632,7 @@ def cookies_pour_playwright(brut: str) -> list[dict]:
             continue
         domaine = str(c.get("domain", "")).lower()
         hote = domaine.lstrip(".")
-        if not any(hote == d or hote.endswith("." + d)
-                   for d in ("chatgpt.com", "openai.com")):
+        if not any(hote == d or hote.endswith("." + d) for d in domaines):
             continue
         ck = {"name": str(c["name"]), "value": str(c["value"]),
               "domain": domaine, "path": c.get("path") or "/",
@@ -622,35 +648,78 @@ def cookies_pour_playwright(brut: str) -> list[dict]:
                 ck["secure"] = True
         sortie.append(ck)
     if not sortie:
-        raise ValueError("aucun témoin de chatgpt.com dans chatgpt_cookies")
+        raise ValueError(f"aucun témoin de {domaines[0]} dans l'export")
     return sortie
 
 
-def _chatgpt_lire_etat() -> dict:
+def envois_du_jour(lignes: list, service: str, jour: str) -> int:
+    """Combien de phrases ce service a reçues ce jour-là (envois réussis)."""
+    n = 0
+    for brut in lignes:
+        try:
+            e = json.loads(brut)
+        except (ValueError, TypeError):
+            continue
+        if e.get("service") == service and e.get("ok") and \
+                str(e.get("quand", "")).startswith(jour):
+            n += 1
+    return n
+
+
+def reponse_apres(texte_page: str, envoye: str, rang: int, saisie: str = "") -> str:
+    """Repli générique : ce qui suit la (rang+1)-ième occurrence de la phrase
+    envoyée — NOTRE message, compté avant l'envoi — et précède la zone de
+    saisie. Pas « la dernière occurrence » : une réponse qui cite la question
+    se faisait couper au milieu (vu au banc)."""
+    cle = envoye.strip()[:200]
+    if not cle:
+        return ""
+    i = -1
+    for _ in range(rang + 1):
+        i = texte_page.find(cle, i + 1)
+        if i < 0:
+            return ""
+    reste = texte_page[i + len(cle):]
+    saisie = saisie.strip()
+    if saisie:
+        j = reste.rfind(saisie)
+        if j >= 0:
+            reste = reste[:j]
+    return reste.strip()
+
+
+def _journaliser(entree: dict) -> None:
     try:
-        with open(CHATGPT_ETAT, encoding="utf-8") as f:
+        with open(NAV_JOURNAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entree, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[navigateur] journal non écrit : {e}", file=sys.stderr)
+
+
+def _lire_journal() -> list:
+    try:
+        with open(NAV_JOURNAL, encoding="utf-8") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
+def _etat_cookies(service: str) -> dict:
+    try:
+        with open(os.path.join(NAV_DIR, f"navigateur_{service}.json"),
+                  encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def _chatgpt_ecrire_etat(etat: dict) -> None:
+def _noter_cookies(service: str, empreinte: str) -> None:
     try:
-        with open(CHATGPT_ETAT, "w", encoding="utf-8") as f:
-            json.dump(etat, f, ensure_ascii=False, indent=1)
+        with open(os.path.join(NAV_DIR, f"navigateur_{service}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"cookies_sha": empreinte}, f)
     except OSError as e:
-        print(f"[chatgpt] état non écrit : {e}", file=sys.stderr)
-
-
-def trop_tot(dernier_succes: str, intervalle_min: int, maintenant: float) -> int:
-    """Secondes à attendre avant le prochain envoi permis (0 = permis)."""
-    if not dernier_succes or intervalle_min <= 0:
-        return 0
-    try:
-        t = datetime.datetime.fromisoformat(dernier_succes).timestamp()
-    except ValueError:
-        return 0
-    return max(0, int(t + intervalle_min * 60 - maintenant))
+        print(f"[navigateur] état non écrit : {e}", file=sys.stderr)
 
 
 def _capture(page) -> str:
@@ -662,19 +731,42 @@ def _capture(page) -> str:
         return ""
 
 
-def _chatgpt_session(res: dict, envoye: threading.Event) -> None:
-    """Tourne dans son propre fil : l'API sync de Playwright est liée au fil
-    qui l'a ouverte. Signale `envoye` dès que la phrase est partie (ou que ça a
-    raté), puis GARDE la page ouverte tant que ChatGPT travaille (bouton
-    « arrêter » visible), au plus `chatgpt_garder_min` minutes — fermer le
-    navigateur en plein travail ne doit pas pouvoir couper sa boucle."""
+def _texte_de(page, selecteur: str) -> str:
+    try:
+        return page.locator(selecteur).inner_text(timeout=3000)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _lire_reponse(page, sv: dict, envoye: str, avant_n: int, avant_occ: int) -> str:
+    if sv["reponses"]:
+        loc = page.locator(sv["reponses"])
+        n = loc.count()
+        if n > avant_n:
+            try:
+                return loc.nth(n - 1).inner_text(timeout=3000).strip()
+            except Exception:  # noqa: BLE001
+                pass
+        return ""
+    saisie = _texte_de(page, sv["saisie"]) if sv["saisie"] else ""
+    return reponse_apres(_texte_de(page, "main") or _texte_de(page, "body"),
+                         envoye, avant_occ, saisie)
+
+
+def _session(service: str, texte: str, res: dict, termine: threading.Event) -> None:
+    """Tourne dans son propre fil (l'API sync de Playwright est liée au fil qui
+    l'ouvre). Met `res` à jour au fil de l'eau ; `termine` = réponse finie ou
+    échec. La page reste ouverte tant que le service travaille, au plus
+    `navigateur_garder_min` minutes : fermer en plein travail ne doit pas
+    pouvoir couper une boucle d'outils de ChatGPT."""
+    sv = SERVICES[service]
+    quand = datetime.datetime.now().isoformat(timespec="seconds")
     try:
         from playwright.sync_api import TimeoutError as PWTimeout
         from playwright.sync_api import sync_playwright
 
-        etat = _chatgpt_lire_etat()
         with sync_playwright() as pw:
-            nav, ctx, mode_nav = _ouvrir_navigateur(pw, "chatgpt")
+            nav, ctx, mode_nav = _ouvrir_navigateur(pw, service)
             res["navigateur"] = mode_nav
             try:
                 try:
@@ -684,106 +776,141 @@ def _chatgpt_session(res: dict, envoye: threading.Event) -> None:
                 bloquees: list = []
                 _garder_anti_ssrf(ctx, bloquees)
 
-                brut = CFG["chatgpt_cookies"]
+                brut = CFG[f"{service}_cookies"]
                 empreinte = hashlib.sha256(brut.encode()).hexdigest() if brut else ""
-                if brut and empreinte != etat.get("cookies_sha"):
-                    ctx.add_cookies(cookies_pour_playwright(brut))
-                    etat["cookies_sha"] = empreinte
-                    _chatgpt_ecrire_etat(etat)
+                if brut and empreinte != _etat_cookies(service).get("cookies_sha"):
+                    ctx.add_cookies(cookies_pour_playwright(brut, sv["domaines_cookies"]))
+                    _noter_cookies(service, empreinte)
                     res["cookies_reinjectes"] = True
 
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 _stealth_lib(ctx, page)
-                page.goto(CFG["chatgpt_conversation"],
+                page.goto(CFG[f"{service}_conversation"],
                           wait_until="domcontentloaded", timeout=40_000)
                 try:
-                    page.wait_for_selector(SEL_COMPOSEUR, timeout=25_000)
+                    page.wait_for_selector(sv["composeur"], timeout=25_000)
                 except PWTimeout:
-                    deconnecte = page.locator(SEL_CONNEXION).count() > 0
+                    deconnecte = page.locator(sv["connexion"]).count() > 0
                     res.update(ok=False, etape="composeur", url=page.url,
                                capture_jpeg=_capture(page),
-                               error=("pas connecté à ChatGPT : recoller les "
-                                      "témoins dans l'option chatgpt_cookies")
+                               error=(f"pas connecté à {service} : recoller les "
+                                      f"témoins dans l'option {service}_cookies")
                                if deconnecte else
                                "zone de saisie introuvable (le site a changé ?)")
                     return
 
-                avant = page.locator(SEL_MSG_USAGER).count()
-                page.click(SEL_COMPOSEUR)
-                page.keyboard.type(CFG["chatgpt_message"], delay=70)
-                page.wait_for_timeout(700)
-                bouton = page.locator(SEL_ENVOYER)
+                cle = texte.strip()[:200]
+                avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
+                avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
+                page.click(sv["composeur"])
+                page.keyboard.insert_text(texte)
+                page.wait_for_timeout(800)
+                bouton = page.locator(sv["envoyer"])
                 if bouton.count() and bouton.first.is_enabled():
                     bouton.first.click()
                 else:
                     page.keyboard.press("Enter")
-                try:
-                    page.wait_for_function(
-                        "([s, n]) => document.querySelectorAll(s).length > n",
-                        arg=[SEL_MSG_USAGER, avant], timeout=15_000)
-                except PWTimeout:
+
+                # La phrase est partie quand elle apparaît UNE fois de plus dans
+                # la page (la zone de saisie, elle, s'est vidée).
+                limite_envoi = time.monotonic() + 15
+                while time.monotonic() < limite_envoi:
+                    page.wait_for_timeout(1000)
+                    occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
+                    if occ > avant_occ:
+                        break
+                else:
                     res.update(ok=False, etape="envoi", url=page.url,
                                capture_jpeg=_capture(page),
                                error="phrase tapée mais jamais apparue dans "
                                      "la conversation")
                     return
 
-                etat["dernier_succes"] = datetime.datetime.now(
-                    datetime.timezone.utc).isoformat(timespec="seconds")
-                _chatgpt_ecrire_etat(etat)
-                res.update(ok=True, etape="envoye", url=page.url,
-                           messages_usager=avant + 1,
-                           message=CFG["chatgpt_message"],
-                           hotes_bloques=bloquees)
-                envoye.set()
+                res.update(ok=True, etape="envoye", fini=False, reponse="",
+                           url=page.url, hotes_bloques=bloquees)
+                _journaliser({"quand": quand, "service": service, "ok": True,
+                              "texte": texte[:500]})
 
-                # Garder ouvert pendant que ChatGPT travaille. Deux constats
-                # « bouton arrêter absent » de suite = vraiment fini (entre
-                # deux appels d'outils, il disparaît un instant).
-                limite = time.monotonic() + CFG["chatgpt_garder_min"] * 60
-                page.wait_for_timeout(10_000)
-                calme = 0
-                while time.monotonic() < limite and calme < 2:
-                    calme = calme + 1 if page.locator(SEL_ARRETER).count() == 0 else 0
-                    page.wait_for_timeout(20_000)
-                print("[chatgpt] page fermée ("
-                      + ("fin du travail" if calme >= 2 else "limite atteinte") + ")",
-                      file=sys.stderr)
+                # Fini = bouton « arrêter » absent ET réponse non vide et
+                # inchangée deux relevés de suite (entre deux appels d'outils,
+                # le bouton disparaît un instant ; la réponse, elle, bouge).
+                limite = time.monotonic() + CFG["navigateur_garder_min"] * 60
+                debut = time.monotonic()
+                precedent, stable = None, 0
+                while time.monotonic() < limite:
+                    page.wait_for_timeout(3000 if time.monotonic() - debut < 120
+                                          else 15000)
+                    rep = _lire_reponse(page, sv, texte, avant_n, avant_occ)
+                    occupe = page.locator(sv["arreter"]).count() > 0
+                    res["reponse"] = rep[:20000]
+                    _DERNIERE[service] = {"texte": texte[:500], "reponse": rep[:20000],
+                                          "fini": False, "quand": quand}
+                    stable = stable + 1 if (rep and rep == precedent and not occupe) else 0
+                    precedent = rep
+                    if stable >= 2:
+                        res["fini"] = True
+                        _DERNIERE[service]["fini"] = True
+                        break
+                termine.set()
+                print(f"[navigateur] {service} : page fermée ("
+                      + ("réponse finie" if res.get("fini") else "limite atteinte")
+                      + ")", file=sys.stderr)
             finally:
                 nav.close()
     except Exception as e:  # noqa: BLE001 - l'erreur remonte au VPS, jamais muette
         if "ok" not in res:
             res.update(ok=False, etape="exception",
                        error=f"{type(e).__name__}: {e}")
-        print(f"[chatgpt] {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"[navigateur] {service} : {type(e).__name__}: {e}", file=sys.stderr)
     finally:
-        envoye.set()
-        _CHATGPT_VERROU.release()
+        if not res.get("ok"):
+            _journaliser({"quand": quand, "service": service, "ok": False,
+                          "texte": texte[:500], "erreur": res.get("error", "")})
+        termine.set()
+        _VERROUS[service].release()
 
 
-def chatgpt_demarre() -> tuple[int, dict]:
-    """(code HTTP, corps). 4xx = la demande est refusée ; 200 = la tentative a
-    eu lieu, `ok` dit si la phrase est partie."""
-    if not conversation_valide(CFG["chatgpt_conversation"]):
-        return 412, {"error": "option chatgpt_conversation absente ou invalide "
-                              "(https://chatgpt.com/...)"}
-    if not CFG["chatgpt_message"]:
-        return 412, {"error": "option chatgpt_message vide"}
-    attente = trop_tot(_chatgpt_lire_etat().get("dernier_succes", ""),
-                       CFG["chatgpt_intervalle_min"], time.time())
-    if attente:
-        return 429, {"error": f"déjà envoyé récemment — réessayer dans {attente} s"}
-    if not _CHATGPT_VERROU.acquire(blocking=False):
-        return 409, {"error": "une session ChatGPT est déjà ouverte"}
+def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
+    """(code HTTP, corps). 4xx = demande refusée ; 200 = la tentative a eu
+    lieu : `ok` dit si la phrase est partie, `fini` si la réponse est complète
+    (sinon /navigateur_lire la donnera plus tard)."""
+    if service not in SERVICES:
+        return 400, {"error": f"service inconnu (permis : {', '.join(SERVICES)})"}
+    if not conversation_valide(service, CFG[f"{service}_conversation"]):
+        return 412, {"error": f"option {service}_conversation absente ou invalide"}
+    texte = (texte or CFG.get(f"{service}_message") or "").strip()
+    if not texte:
+        return 400, {"error": "texte vide (et aucun message par défaut en option)"}
+    if len(texte) > TEXTE_MAX:
+        return 413, {"error": f"texte trop long (> {TEXTE_MAX} caractères)"}
+    jour = datetime.date.today().isoformat()
+    deja = envois_du_jour(_lire_journal(), service, jour)
+    if deja >= CFG["navigateur_max_par_jour"]:
+        return 429, {"error": f"plafond du jour atteint ({deja} phrases à {service})"}
+    if not _VERROUS[service].acquire(blocking=False):
+        return 409, {"error": f"{service} travaille encore sur la phrase précédente "
+                              "(voir /navigateur_lire)"}
     res: dict = {}
-    envoye = threading.Event()
-    threading.Thread(target=_chatgpt_session, args=(res, envoye),
+    termine = threading.Event()
+    threading.Thread(target=_session, args=(service, texte, res, termine),
                      daemon=True).start()
-    # Sous les 100 s de Cloudflare : goto 40 + composeur 25 + envoi 15 + marge.
-    if not envoye.wait(timeout=88):
-        return 200, {"ok": False, "etape": "attente",
-                     "error": "toujours en cours après 88 s"}
-    return 200, dict(res)
+    # Sous les 100 s de Cloudflare. Pas fini à temps = on rend le partiel.
+    termine.wait(timeout=88)
+    corps = dict(res)
+    if not corps:
+        corps = {"ok": False, "etape": "attente", "error": "toujours en cours après 88 s"}
+    return 200, corps
+
+
+def navigateur_lire(service: str) -> tuple[int, dict]:
+    """Le dernier échange connu de ce service depuis le démarrage de l'add-on."""
+    if service not in SERVICES:
+        return 400, {"error": f"service inconnu (permis : {', '.join(SERVICES)})"}
+    d = _DERNIERE.get(service)
+    if not d:
+        return 404, {"error": "aucun échange en mémoire depuis le démarrage"}
+    return 200, {"ok": True, "service": service,
+                 "en_cours": _VERROUS[service].locked(), **d}
 
 
 # --------------------------------------------------------------------------- #
@@ -857,7 +984,8 @@ class Handler(BaseHTTPRequestHandler):
                 # savoir depuis le VPS (le proxy Supervisor de HA refuse les
                 # jetons longue durée). Dit aussi si Chromium est bien là.
                 "arch": platform.machine(),
-                "verbes": ["/fetch"] + (["/render", "/chatgpt_demarre"]
+                "verbes": ["/fetch"] + (["/render", "/navigateur_dire",
+                                       "/navigateur_lire"]
                                       if CFG["render_enabled"] else []),
             })
             return
@@ -866,16 +994,20 @@ class Handler(BaseHTTPRequestHandler):
             self._route_render(qs)
             return
 
-        if parsed.path == "/chatgpt_demarre":
-            # Pas d'URL ici : seul le jeton porteur s'applique. La cible est
-            # une OPTION de l'add-on, jamais un paramètre (voir la section).
+        if parsed.path in ("/navigateur_dire", "/navigateur_lire"):
+            # Pas d'URL ici : seul le jeton porteur s'applique. La conversation
+            # est une OPTION de l'add-on, jamais un paramètre (voir la section).
             if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
                 self._json(401, {"error": "jeton invalide"})
                 return
             if not CFG["render_enabled"]:
                 self._json(503, {"error": "navigateur désactivé (option render_enabled)"})
                 return
-            code, corps = chatgpt_demarre()
+            service = (qs.get("service") or [""])[0]
+            if parsed.path == "/navigateur_lire":
+                code, corps = navigateur_lire(service)
+            else:
+                code, corps = navigateur_dire(service, (qs.get("texte") or [""])[0])
             self._json(code, corps)
             return
 
