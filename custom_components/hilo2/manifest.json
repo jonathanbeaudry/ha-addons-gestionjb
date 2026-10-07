@@ -1,0 +1,20 @@
+{
+  "domain": "hilo2",
+  "name": "Hilo 2 (2e compte)",
+  "after_dependencies": [
+    "energy",
+    "integration",
+    "utility_meter"
+  ],
+  "codeowners": [
+    "@dvd-dev"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/dvd-dev/hilo",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/dvd-dev/hilo/issues",
+  "requirements": [
+    "python-hilo>=2026.9.1"
+  ],
+  "version": "2026.9.5"
+}

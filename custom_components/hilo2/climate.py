@@ -1,0 +1,141 @@
+"""Support for Hilo Climate entities."""
+
+from datetime import datetime, timedelta
+
+from homeassistant.components.climate import ClimateEntity
+from homeassistant.components.climate.const import (
+    ClimateEntityFeature,
+    HVACAction,
+    HVACMode,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    PRECISION_TENTHS,
+    Platform,
+    UnitOfTemperature,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import slugify
+
+from . import Hilo
+from .const import CLIMATE_CLASSES, DOMAIN, LOG
+from .entity import HiloEntity
+
+
+def validate_reduction_phase(events, tag):
+    """Validate if current time is within a challenge lock reduction phase."""
+    if not events:
+        return
+    current = events[0]
+    phases = current["phases"]
+    start = phases["reduction_start"]
+    end = phases["reduction_end"]
+    if (
+        start + timedelta(minutes=2)
+        < datetime.now(start.tzinfo)
+        < end - timedelta(minutes=2)
+    ):
+        LOG.warning(
+            f"{tag} Attempt to set temperature was blocked because challenge lock is active"
+        )
+        # Raising an exception here will raise it up to the GUI
+        raise Exception("Challenge lock is active, unable to change temperature target")
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    """Set up Hilo climate entities from a config entry."""
+    hilo = hass.data[DOMAIN][entry.entry_id]
+    entities = []
+    for d in hilo.devices.all:
+        if d.type in CLIMATE_CLASSES:
+            d._entity = HiloClimate(hilo, d)
+            entities.append(d._entity)
+    async_add_entities(entities)
+    return True
+
+
+class HiloClimate(HiloEntity, ClimateEntity):
+    """Representation of a Hilo Climate entity."""
+
+    _attr_hvac_modes = [HVACMode.HEAT]
+    _attr_temperature_unit: str = UnitOfTemperature.CELSIUS
+    _attr_precision: float = PRECISION_TENTHS
+    _attr_supported_features: int = ClimateEntityFeature.TARGET_TEMPERATURE
+
+    def __init__(self, hilo: Hilo, device):
+        """Initialize the climate entity."""
+        super().__init__(hilo, device=device, name=device.name)
+        old_unique_id = f"{slugify(device.name)}-climate"
+        self._attr_unique_id = f"{device.identifier.lower()}-climate"
+        hilo.async_migrate_unique_id(
+            old_unique_id, self._attr_unique_id, Platform.CLIMATE
+        )
+        hilo.async_migrate_unique_id(
+            f"{slugify(device.identifier)}-climate",
+            self._attr_unique_id,
+            Platform.CLIMATE,
+        )
+        self.operations = [HVACMode.HEAT]
+        self._has_operation = False
+        self._temperature_entity = None
+        LOG.debug("Setting up Climate entity: %s", self._attr_name)
+
+    @property
+    def current_temperature(self):
+        """Return the current temperature."""
+        return self._device.current_temperature
+
+    @property
+    def target_temperature(self):
+        """Return the target temperature."""
+        return self._device.target_temperature
+
+    @property
+    def max_temp(self):
+        """Return the maximum temperature."""
+        return self._device.max_temp
+
+    @property
+    def min_temp(self):
+        """Return the minimum temperature."""
+        return self._device.min_temp
+
+    def set_hvac_mode(self, hvac_mode):
+        """Set hvac mode."""
+        return
+
+    @property
+    def hvac_mode(self):
+        """Return hvac mode."""
+        return HVACMode.HEAT
+
+    @property
+    def hvac_action(self):
+        """Return the current hvac action."""
+        return self._device.hvac_action
+
+    @property
+    def icon(self):
+        """Return the icon to use in the frontend, based on hvac_action."""
+        if self._device.hvac_action == HVACAction.HEATING:
+            return "mdi:radiator"
+        return "mdi:radiator-disabled"
+
+    async def async_set_temperature(self, **kwargs):
+        """Set new target temperature."""
+        if ATTR_TEMPERATURE in kwargs:
+            if self._hilo.challenge_lock:
+                challenge = self._hilo._hass.states.get("sensor.defi_hilo")
+                validate_reduction_phase(
+                    challenge.attributes.get("next_events", []), self._device._tag
+                )
+            LOG.info(
+                f"{self._device._tag} Setting temperature to {kwargs[ATTR_TEMPERATURE]}"
+            )
+            await self._device.set_attribute(
+                "target_temperature", kwargs[ATTR_TEMPERATURE]
+            )
