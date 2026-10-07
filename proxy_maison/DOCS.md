@@ -83,3 +83,15 @@ message par défaut de ChatGPT (« fait prochaine sur le mcp carcajou »).
 qu'un service travaille. Chaque phrase est notée dans
 `/data/navigateur_journal.jsonl`. Si une session expire, le VPS t'envoie un
 push : recolle les témoins et redémarre l'add-on.
+
+## Relancer Home Assistant à distance (2.10.0)
+
+Cet add-on tourne sous le Supervisor : il reste debout quand HA tombe. Le VPS
+peut donc demander `/ha_redemarrer?niveau=core` (relancer HA) ou `machine`
+(redémarrer la machine), et lire `/ha_etat` et `/ha_journal`. La mise à jour
+demande l'accès au Supervisor (rôle **manager**) : HA te le montrera en
+installant — c'est voulu.
+
+Garde-fous : jeton, **refus si HA répond**, une relance par heure, push sur
+ton téléphone avant chaque relance. Interrupteur : option `redemarrage_ha`.
+Journal : `/data/relances_ha.jsonl`.

@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.8.0"
+SERVICE_VERSION = "2.10.0"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -158,6 +158,7 @@ def _charger_config() -> dict:
         "grok_cookies": "",
         "navigateur_max_par_jour": 30,
         "navigateur_garder_min": 120,
+        "redemarrage_ha": True,
     }
     env_allow = os.environ.get("ALLOWLIST", "")
     if env_allow:
@@ -186,6 +187,8 @@ def _charger_config() -> dict:
                         "grok_message", "grok_cookies"):
                 if opts.get(cle):
                     cfg[cle] = str(opts[cle]).strip()
+            if "redemarrage_ha" in opts:
+                cfg["redemarrage_ha"] = bool(opts["redemarrage_ha"])
             for cle in ("navigateur_max_par_jour", "navigateur_garder_min"):
                 if opts.get(cle) is not None:
                     cfg[cle] = int(opts[cle])
@@ -917,6 +920,143 @@ def navigateur_lire(service: str) -> tuple[int, dict]:
 # Serveur HTTP
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Relancer Home Assistant à distance (2.10.0)
+# --------------------------------------------------------------------------- #
+# Jonathan, 2026-10-07 (« go 1 ») : HA est tombé à 10 h 10 pendant qu'il était
+# loin, Nabu Casa ET le tunnel morts avec lui, et personne à la maison. Cet
+# add-on tourne sous le SUPERVISOR, pas sous HA : il restait debout. Il gagne
+# donc le droit de demander au Supervisor de relancer le cœur, ou la machine.
+#
+# Garde-fous, tous ici (le VPS n'en porte aucun qui compte) :
+#   · jeton porteur, comme tous les verbes ;
+#   · option `redemarrage_ha` = coupe-circuit ;
+#   · REFUS si HA répond encore localement — ce n'est pas un bouton de confort ;
+#   · UNE relance par heure au plus (journal sous /data, survit au redémarrage).
+# `machine` (reboot de l'hôte) exige `hassio_role: manager` ; `core` suffirait
+# avec `homeassistant`. Mesuré nulle part encore : premier vrai essai = la
+# prochaine panne.
+
+SUPERVISEUR = "http://supervisor"
+HA_LOCAL = "http://127.0.0.1:8123/manifest.json"   # host_network : HA est là
+RELANCE_JOURNAL = os.path.join(NAV_DIR, "relances_ha.jsonl")
+RELANCE_ECART_S = 3600
+RELANCE_CHEMINS = {"core": "/core/restart", "machine": "/host/reboot"}
+
+
+def ha_repond(timeout: float = 5) -> bool:
+    try:
+        with urllib.request.urlopen(HA_LOCAL, timeout=timeout) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _superviseur(methode: str, chemin: str, timeout: float = 30) -> tuple[int, bytes]:
+    jeton = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not jeton:
+        return 503, b"SUPERVISOR_TOKEN absent (hassio_api off ?)"
+    req = urllib.request.Request(SUPERVISEUR + chemin, method=methode,
+                                 headers={"Authorization": "Bearer " + jeton})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        return 502, str(e).encode()
+
+
+def derniere_relance(lignes: list) -> float:
+    """L'horodatage (epoch) de la dernière relance LANCÉE, 0 si aucune.
+    Une relance que le Supervisor a REFUSÉE (4xx/5xx sauf 502 : un reboot coupe
+    la connexion) ne compte pas : on doit pouvoir tenter `machine` juste après."""
+    entrees = []
+    for brut in lignes:
+        try:
+            entrees.append(json.loads(brut))
+        except ValueError:
+            continue
+    refusees = {e.get("lancement") for e in entrees
+                if isinstance(e.get("resultat"), int) and e["resultat"] >= 400
+                and e["resultat"] != 502}
+    for e in reversed(entrees):
+        if e.get("lancee") and e.get("t") not in refusees:
+            return float(e.get("t", 0))
+    return 0.0
+
+
+def _lire_relances() -> list:
+    try:
+        with open(RELANCE_JOURNAL, encoding="utf-8") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
+def _noter_relance(entree: dict) -> None:
+    try:
+        with open(RELANCE_JOURNAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entree, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[relance] journal non écrit : {e}", file=sys.stderr)
+
+
+def ha_etat() -> tuple[int, dict]:
+    code, brut = _superviseur("GET", "/core/info", 10)
+    info = {}
+    if code == 200:
+        try:
+            info = json.loads(brut).get("data", {})
+        except ValueError:
+            pass
+    return 200, {
+        "ok": True,
+        "ha_repond": ha_repond(),
+        "superviseur": code,
+        "core": {k: info.get(k) for k in ("version", "version_latest",
+                                          "update_available", "boot",
+                                          "watchdog", "state") if k in info},
+        "derniere_relance": derniere_relance(_lire_relances()) or None,
+    }
+
+
+def ha_journal(lignes: int) -> tuple[int, dict]:
+    code, brut = _superviseur("GET", "/core/logs", 20)
+    if code != 200:
+        return 502, {"ok": False, "error": f"superviseur {code}: {brut[:300]!r}"}
+    texte = brut.decode("utf-8", "replace").splitlines()
+    return 200, {"ok": True, "lignes": texte[-max(1, min(lignes, 2000)):]}
+
+
+def ha_redemarrer(niveau: str, maintenant: float | None = None) -> tuple[int, dict]:
+    maintenant = time.time() if maintenant is None else maintenant
+    if not CFG["redemarrage_ha"]:
+        return 503, {"ok": False, "error": "relance désactivée (option redemarrage_ha)"}
+    if niveau not in RELANCE_CHEMINS:
+        return 400, {"ok": False, "error": "niveau = core ou machine"}
+    if ha_repond():
+        return 409, {"ok": False, "error": "HA répond localement : rien à relancer"}
+    avant = derniere_relance(_lire_relances())
+    if avant and maintenant - avant < RELANCE_ECART_S:
+        reste = int(RELANCE_ECART_S - (maintenant - avant)) // 60 + 1
+        return 429, {"ok": False, "error": f"une relance par heure — encore {reste} min"}
+    _noter_relance({"t": maintenant, "niveau": niveau, "lancee": True})
+
+    # Le Supervisor ne rend la main qu'une fois HA relancé (minutes), et un
+    # reboot coupe la réponse : on répond 202 tout de suite, le résultat va
+    # au journal.
+    def _lancer() -> None:
+        code, brut = _superviseur("POST", RELANCE_CHEMINS[niveau], 600)
+        _noter_relance({"t": time.time(), "lancement": maintenant,
+                        "niveau": niveau, "resultat": code,
+                        "detail": brut[:300].decode("utf-8", "replace")})
+        print(f"[relance] {niveau} → superviseur {code}", file=sys.stderr)
+
+    threading.Thread(target=_lancer, daemon=True).start()
+    return 202, {"ok": True, "lancee": niveau}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ProxyMaison/2.1"
 
@@ -986,8 +1126,23 @@ class Handler(BaseHTTPRequestHandler):
                 "arch": platform.machine(),
                 "verbes": ["/fetch"] + (["/render", "/navigateur_dire",
                                        "/navigateur_lire"]
-                                      if CFG["render_enabled"] else []),
+                                      if CFG["render_enabled"] else [])
+                          + ["/ha_etat", "/ha_journal", "/ha_redemarrer"],
             })
+            return
+
+        if parsed.path in ("/ha_etat", "/ha_journal", "/ha_redemarrer"):
+            if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
+                self._json(401, {"error": "jeton invalide"})
+                return
+            if parsed.path == "/ha_etat":
+                code, corps = ha_etat()
+            elif parsed.path == "/ha_journal":
+                n = (qs.get("lignes") or ["200"])[0]
+                code, corps = ha_journal(int(n) if n.isdigit() else 200)
+            else:
+                code, corps = ha_redemarrer((qs.get("niveau") or [""])[0])
+            self._json(code, corps)
             return
 
         if parsed.path == "/render":

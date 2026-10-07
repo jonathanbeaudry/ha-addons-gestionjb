@@ -4,7 +4,7 @@
 # (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
 # remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
 name: Proxy maison (sortie résidentielle)
-version: "2.9.0"
+version: "2.10.0"
 slug: proxy_maison
 description: >-
   Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
@@ -18,6 +18,11 @@ arch:
 # Réseau hôte : le port 8099 est ouvert directement sur l'hôte, ce qui rend le
 # service joignable par l'add-on Cloudflared (via l'IP LAN de la machine).
 host_network: true
+# 2.10.0 : parler au Supervisor pour RELANCER HA quand il est tombé (/ha_redemarrer).
+# `manager` est le plus petit rôle qui permet /host/reboot. Voir fetch_server.py,
+# section « Relancer Home Assistant à distance ».
+hassio_api: true
+hassio_role: manager
 init: false
 options:
   token: ""
@@ -45,6 +50,8 @@ options:
   grok_cookies: ""
   navigateur_max_par_jour: 30
   navigateur_garder_min: 120
+  # /ha_redemarrer (2.10.0) : coupe-circuit de la relance de HA à distance.
+  redemarrage_ha: true
 schema:
   token: str
   allowlist:
@@ -61,3 +68,4 @@ schema:
   grok_cookies: password?
   navigateur_max_par_jour: int(1,200)
   navigateur_garder_min: int(1,600)
+  redemarrage_ha: bool?
