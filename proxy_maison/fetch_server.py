@@ -41,6 +41,9 @@ paresseux** (dans la fonction) pour la même raison qu'au point 1.
 
 from __future__ import annotations
 
+import base64
+import datetime
+import hashlib
 import http.cookiejar
 import ipaddress
 import json
@@ -49,12 +52,14 @@ import platform
 import re
 import socket
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.0.0"
+SERVICE_VERSION = "2.8.0"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -143,6 +148,12 @@ def _charger_config() -> dict:
         "render_enabled": os.environ.get("RENDER_ENABLED", "true").lower()
         not in ("0", "false", "no"),
         "render_timeout": int(os.environ.get("RENDER_TIMEOUT", "45")),
+        # /chatgpt_demarre — voir la section du même nom. Vide = verbe fermé.
+        "chatgpt_conversation": "",
+        "chatgpt_message": "fait prochaine sur le mcp carcajou",
+        "chatgpt_cookies": "",
+        "chatgpt_intervalle_min": 60,
+        "chatgpt_garder_min": 120,
     }
     env_allow = os.environ.get("ALLOWLIST", "")
     if env_allow:
@@ -166,6 +177,13 @@ def _charger_config() -> dict:
                 cfg["render_enabled"] = bool(opts["render_enabled"])
             if opts.get("render_timeout"):
                 cfg["render_timeout"] = int(opts["render_timeout"])
+            for cle in ("chatgpt_conversation", "chatgpt_message",
+                        "chatgpt_cookies"):
+                if opts.get(cle):
+                    cfg[cle] = str(opts[cle]).strip()
+            for cle in ("chatgpt_intervalle_min", "chatgpt_garder_min"):
+                if opts.get(cle) is not None:
+                    cfg[cle] = int(opts[cle])
         except (OSError, ValueError, json.JSONDecodeError) as e:
             print(f"[config] options.json illisible: {e}", file=sys.stderr)
 
@@ -313,6 +331,80 @@ def _fetch(url: str, referer: str = "",
 
 
 # --------------------------------------------------------------------------- #
+# Le navigateur — partagé par /render et /chatgpt_demarre
+# --------------------------------------------------------------------------- #
+
+# Sans --no-sandbox, Chromium/Chrome refuse de démarrer dans un conteneur
+# d'add-on (pas de user namespaces). L'isolation ici, c'est le conteneur
+# lui-même. --disable-blink-features=AutomationControlled éteint côté moteur
+# le drapeau navigator.webdriver que reCAPTCHA lit.
+ARGS_NAV = ["--no-sandbox", "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled"]
+
+
+def _ouvrir_navigateur(pw, profil: str = ""):
+    """(nav, ctx, mode). Voie 1 = vrai Chrome + écran (xvfb) : l'identité
+    d'un visiteur normal pour que reCAPTCHA Enterprise NOTE « humain » et
+    laisse passer georss (note en tête + mémoire waze-usage-perso). Voie 2
+    (repli) = Chromium headless d'origine — pour que /render ne meure JAMAIS
+    si Chrome ou l'écran virtuel manquent dans l'image."""
+    # DISPLAY présent = run.sh a lancé xvfb → on peut faire du graphique.
+    if os.environ.get("DISPLAY"):
+        try:
+            opts = {"locale": "fr-CA",
+                    "viewport": {"width": 1366, "height": 900}}
+            # Pas de user_agent forcé : un vrai Chrome présente SON UA et ses
+            # client-hints cohérents — moins « menteur » qu'un UA plaqué.
+            base = dict(headless=False, channel="chrome", args=ARGS_NAV,
+                        ignore_default_args=["--enable-automation"])
+            if profil:
+                # Profils Chrome à part : un dossier écrit par Chromium puis
+                # rouvert par Chrome peut coincer. On repart propre.
+                c = pw.chromium.launch_persistent_context(
+                    os.path.join("/data/profils_chrome", profil),
+                    **base, **opts)
+                return c, c, "chrome-graphique"
+            n = pw.chromium.launch(**base)
+            return n, n.new_context(**opts), "chrome-graphique"
+        except Exception as e:  # noqa: BLE001 - Chrome/xvfb absent → repli
+            print(f"[render] Chrome graphique indisponible "
+                  f"({type(e).__name__}: {e}) — repli Chromium headless",
+                  file=sys.stderr)
+    # Voie 2 : l'ancien comportement — UA Firefox plaqué, headless.
+    opts = {"user_agent": BROWSER_UA, "locale": "fr-CA",
+            "viewport": {"width": 1366, "height": 900}}
+    if profil:
+        # /data = stockage persistant de l'add-on (survit aux mises à jour).
+        c = pw.chromium.launch_persistent_context(
+            os.path.join("/data/profils", profil),
+            headless=True, args=ARGS_NAV, **opts)
+        return c, c, "chromium-headless"
+    n = pw.chromium.launch(headless=True, args=ARGS_NAV)
+    return n, n.new_context(**opts), "chromium-headless"
+
+
+def _garder_anti_ssrf(ctx, bloquees: list) -> None:
+    """⚠️ ANTI-SSRF, 2e étage — indispensable dès qu'un navigateur tourne.
+    `_verrous()` ne valide que l'URL DEMANDÉE. Une fois la page ouverte, c'est
+    ELLE qui décide quoi charger : images, XHR, iframes, redirections. Un site
+    hostile pourrait donc faire tâter 192.168.x à Chromium — un trou qui
+    n'existe pas avec /fetch. Ici chaque requête du navigateur est vérifiée,
+    pas juste la première. Partagé par /render et /chatgpt_demarre."""
+    def _garde(route, requete) -> None:
+        hote = urllib.parse.urlparse(requete.url).hostname or ""
+        if hote and not _hote_sur_pour_navigateur(hote):
+            if hote not in bloquees:
+                bloquees.append(hote)
+                print(f"[navigateur] requête bloquée (IP non publique): {hote}",
+                      file=sys.stderr)
+            route.abort()
+            return
+        route.continue_()
+
+    ctx.route("**/*", _garde)
+
+
+# --------------------------------------------------------------------------- #
 # /render — la page avec son JavaScript exécuté (Chromium)
 # --------------------------------------------------------------------------- #
 
@@ -352,55 +444,8 @@ def _render(url: str, referer: str = "", attendre: str = "",
     bloquees: list[str] = []
     _CACHE_HOTES.clear()
 
-    # Sans --no-sandbox, Chromium/Chrome refuse de démarrer dans un conteneur
-    # d'add-on (pas de user namespaces). L'isolation ici, c'est le conteneur
-    # lui-même. --disable-blink-features=AutomationControlled éteint côté moteur
-    # le drapeau navigator.webdriver que reCAPTCHA lit.
-    args_nav = ["--no-sandbox", "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled"]
-
-    def _ouvrir(pw):
-        """(nav, ctx, mode). Voie 1 = vrai Chrome + écran (xvfb) : l'identité
-        d'un visiteur normal pour que reCAPTCHA Enterprise NOTE « humain » et
-        laisse passer georss (note en tête + mémoire waze-usage-perso). Voie 2
-        (repli) = Chromium headless d'origine — pour que /render ne meure JAMAIS
-        si Chrome ou l'écran virtuel manquent dans l'image."""
-        # DISPLAY présent = run.sh a lancé xvfb → on peut faire du graphique.
-        if os.environ.get("DISPLAY"):
-            try:
-                opts = {"locale": "fr-CA",
-                        "viewport": {"width": 1366, "height": 900}}
-                # Pas de user_agent forcé : un vrai Chrome présente SON UA et ses
-                # client-hints cohérents — moins « menteur » qu'un UA plaqué.
-                base = dict(headless=False, channel="chrome", args=args_nav,
-                            ignore_default_args=["--enable-automation"])
-                if profil:
-                    # Profils Chrome à part : un dossier écrit par Chromium puis
-                    # rouvert par Chrome peut coincer. On repart propre.
-                    c = pw.chromium.launch_persistent_context(
-                        os.path.join("/data/profils_chrome", profil),
-                        **base, **opts)
-                    return c, c, "chrome-graphique"
-                n = pw.chromium.launch(**base)
-                return n, n.new_context(**opts), "chrome-graphique"
-            except Exception as e:  # noqa: BLE001 - Chrome/xvfb absent → repli
-                print(f"[render] Chrome graphique indisponible "
-                      f"({type(e).__name__}: {e}) — repli Chromium headless",
-                      file=sys.stderr)
-        # Voie 2 : l'ancien comportement — UA Firefox plaqué, headless.
-        opts = {"user_agent": BROWSER_UA, "locale": "fr-CA",
-                "viewport": {"width": 1366, "height": 900}}
-        if profil:
-            # /data = stockage persistant de l'add-on (survit aux mises à jour).
-            c = pw.chromium.launch_persistent_context(
-                os.path.join("/data/profils", profil),
-                headless=True, args=args_nav, **opts)
-            return c, c, "chromium-headless"
-        n = pw.chromium.launch(headless=True, args=args_nav)
-        return n, n.new_context(**opts), "chromium-headless"
-
     with sync_playwright() as pw:
-        nav, ctx, mode_nav = _ouvrir(pw)
+        nav, ctx, mode_nav = _ouvrir_navigateur(pw, profil)
         try:
             # Socle stealth : injecté AVANT toute navigation, sur chaque page.
             try:
@@ -408,25 +453,7 @@ def _render(url: str, referer: str = "", attendre: str = "",
             except Exception:  # noqa: BLE001
                 pass
 
-            # ⚠️ ANTI-SSRF, 2e étage — indispensable et propre à /render.
-            # `_verrous()` ne valide que l'URL DEMANDÉE. Une fois la page
-            # ouverte, c'est ELLE qui décide quoi charger : images, XHR,
-            # iframes, redirections. Un site hostile pourrait donc faire tâter
-            # 192.168.x à Chromium — un trou qui n'existe pas avec /fetch.
-            # Ici chaque requête du navigateur est vérifiée, pas juste la
-            # première.
-            def _garde(route, requete) -> None:
-                hote = urllib.parse.urlparse(requete.url).hostname or ""
-                if hote and not _hote_sur_pour_navigateur(hote):
-                    if hote not in bloquees:
-                        bloquees.append(hote)
-                        print(f"[render] requête bloquée (IP non publique): {hote}",
-                              file=sys.stderr)
-                    route.abort()
-                    return
-                route.continue_()
-
-            ctx.route("**/*", _garde)
+            _garder_anti_ssrf(ctx, bloquees)
             page = ctx.new_page()
             # playwright-stealth EN PLUS du socle maison (best-effort, jamais
             # fatal) — la 3ᵉ couche de « fait les 3 ».
@@ -512,6 +539,254 @@ def _render(url: str, referer: str = "", attendre: str = "",
 
 
 # --------------------------------------------------------------------------- #
+# /chatgpt_demarre — taper LA phrase dans LA conversation ChatGPT de Jonathan
+# --------------------------------------------------------------------------- #
+#
+# Demandé par Jonathan le 2026-10-07 : les tâches planifiées de ChatGPT ne
+# démarrent pas son travail ; il devait écrire lui-même, chaque jour,
+# « fait prochaine sur le mcp carcajou ». Ce verbe le fait à sa place, UNE fois
+# par jour (le rythme est décidé par le VPS, borné ici par un intervalle
+# minimal).
+#
+# ⚠️ Le VPS ne fournit NI le texte NI la conversation : les deux sont des
+# OPTIONS de l'add-on, réglées par Jonathan dans HA. Le VPS ne peut que dire
+# « vas-y ». Accepter un texte venu du VPS ferait de ce verbe une porte pour
+# faire dire n'importe quoi à son ChatGPT — même raison que l'absence de
+# `?script=`.
+#
+# ⚠️ Conditions d'utilisation : OpenAI n'autorise pas le pilotage de son site
+# par un robot. Jonathan l'a su avant de trancher (2026-10-07) ; c'est son
+# compte, une phrase par jour. Ne PAS en faire une boucle : l'intervalle
+# minimal est là pour ça.
+#
+# La connexion : un profil Chrome PERSISTANT (`chatgpt`) sous /data. Il est
+# amorcé par les témoins de connexion que Jonathan exporte de son propre Chrome
+# (extension Cookie-Editor → Export JSON) et colle dans l'option
+# `chatgpt_cookies`. Ils ne sont réinjectés que quand l'option CHANGE : sinon
+# on écraserait la session que le profil a rafraîchie lui-même.
+
+CHATGPT_ETAT = "/data/chatgpt_demarre.json"
+_CHATGPT_VERROU = threading.Lock()
+
+# Les sélecteurs de chatgpt.com — en un seul endroit : le jour où le site
+# change, c'est ici qu'on regarde, et l'échec le dit (capture d'écran rendue).
+SEL_COMPOSEUR = "#prompt-textarea"
+SEL_ENVOYER = '[data-testid="send-button"], #composer-submit-button'
+SEL_ARRETER = '[data-testid="stop-button"]'
+SEL_MSG_USAGER = '[data-message-author-role="user"]'
+SEL_CONNEXION = '[data-testid="login-button"]'
+
+
+def conversation_valide(url: str) -> bool:
+    """Une conversation chatgpt.com, rien d'autre (https, hôte exact)."""
+    p = urllib.parse.urlparse(url or "")
+    return (p.scheme == "https" and p.hostname in ("chatgpt.com", "www.chatgpt.com")
+            and len(p.path) > 1)
+
+
+def cookies_pour_playwright(brut: str) -> list[dict]:
+    """Export Cookie-Editor (liste JSON, ou {"cookies": [...]}) → format
+    Playwright. Seuls les témoins de chatgpt.com / openai.com passent : un
+    export trop large ne doit pas semer d'autres sessions dans ce profil.
+    Lève ValueError si l'export est illisible ou vide."""
+    try:
+        data = json.loads(brut)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"chatgpt_cookies n'est pas du JSON : {e}") from e
+    if isinstance(data, dict):
+        data = data.get("cookies", [])
+    if not isinstance(data, list):
+        raise ValueError("chatgpt_cookies doit être une liste de témoins")
+    sites = {"no_restriction": "None", "none": "None", "lax": "Lax",
+             "strict": "Strict"}
+    sortie = []
+    for c in data:
+        if not isinstance(c, dict) or not c.get("name") or "value" not in c:
+            continue
+        domaine = str(c.get("domain", "")).lower()
+        hote = domaine.lstrip(".")
+        if not any(hote == d or hote.endswith("." + d)
+                   for d in ("chatgpt.com", "openai.com")):
+            continue
+        ck = {"name": str(c["name"]), "value": str(c["value"]),
+              "domain": domaine, "path": c.get("path") or "/",
+              "secure": bool(c.get("secure", True)),
+              "httpOnly": bool(c.get("httpOnly", False))}
+        expire = c.get("expirationDate") or c.get("expires")
+        if isinstance(expire, (int, float)) and expire > 0:
+            ck["expires"] = float(expire)
+        site = sites.get(str(c.get("sameSite") or "").lower())
+        if site:
+            ck["sameSite"] = site
+            if site == "None":
+                ck["secure"] = True
+        sortie.append(ck)
+    if not sortie:
+        raise ValueError("aucun témoin de chatgpt.com dans chatgpt_cookies")
+    return sortie
+
+
+def _chatgpt_lire_etat() -> dict:
+    try:
+        with open(CHATGPT_ETAT, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _chatgpt_ecrire_etat(etat: dict) -> None:
+    try:
+        with open(CHATGPT_ETAT, "w", encoding="utf-8") as f:
+            json.dump(etat, f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        print(f"[chatgpt] état non écrit : {e}", file=sys.stderr)
+
+
+def trop_tot(dernier_succes: str, intervalle_min: int, maintenant: float) -> int:
+    """Secondes à attendre avant le prochain envoi permis (0 = permis)."""
+    if not dernier_succes or intervalle_min <= 0:
+        return 0
+    try:
+        t = datetime.datetime.fromisoformat(dernier_succes).timestamp()
+    except ValueError:
+        return 0
+    return max(0, int(t + intervalle_min * 60 - maintenant))
+
+
+def _capture(page) -> str:
+    """Capture d'écran JPEG en base64 — pour qu'un échec soit VU, pas deviné."""
+    try:
+        return base64.b64encode(
+            page.screenshot(type="jpeg", quality=45)).decode("ascii")
+    except Exception:  # noqa: BLE001 - une capture ratée ne masque pas l'erreur
+        return ""
+
+
+def _chatgpt_session(res: dict, envoye: threading.Event) -> None:
+    """Tourne dans son propre fil : l'API sync de Playwright est liée au fil
+    qui l'a ouverte. Signale `envoye` dès que la phrase est partie (ou que ça a
+    raté), puis GARDE la page ouverte tant que ChatGPT travaille (bouton
+    « arrêter » visible), au plus `chatgpt_garder_min` minutes — fermer le
+    navigateur en plein travail ne doit pas pouvoir couper sa boucle."""
+    try:
+        from playwright.sync_api import TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
+
+        etat = _chatgpt_lire_etat()
+        with sync_playwright() as pw:
+            nav, ctx, mode_nav = _ouvrir_navigateur(pw, "chatgpt")
+            res["navigateur"] = mode_nav
+            try:
+                try:
+                    ctx.add_init_script(_STEALTH_JS)
+                except Exception:  # noqa: BLE001
+                    pass
+                bloquees: list = []
+                _garder_anti_ssrf(ctx, bloquees)
+
+                brut = CFG["chatgpt_cookies"]
+                empreinte = hashlib.sha256(brut.encode()).hexdigest() if brut else ""
+                if brut and empreinte != etat.get("cookies_sha"):
+                    ctx.add_cookies(cookies_pour_playwright(brut))
+                    etat["cookies_sha"] = empreinte
+                    _chatgpt_ecrire_etat(etat)
+                    res["cookies_reinjectes"] = True
+
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                _stealth_lib(ctx, page)
+                page.goto(CFG["chatgpt_conversation"],
+                          wait_until="domcontentloaded", timeout=40_000)
+                try:
+                    page.wait_for_selector(SEL_COMPOSEUR, timeout=25_000)
+                except PWTimeout:
+                    deconnecte = page.locator(SEL_CONNEXION).count() > 0
+                    res.update(ok=False, etape="composeur", url=page.url,
+                               capture_jpeg=_capture(page),
+                               error=("pas connecté à ChatGPT : recoller les "
+                                      "témoins dans l'option chatgpt_cookies")
+                               if deconnecte else
+                               "zone de saisie introuvable (le site a changé ?)")
+                    return
+
+                avant = page.locator(SEL_MSG_USAGER).count()
+                page.click(SEL_COMPOSEUR)
+                page.keyboard.type(CFG["chatgpt_message"], delay=70)
+                page.wait_for_timeout(700)
+                bouton = page.locator(SEL_ENVOYER)
+                if bouton.count() and bouton.first.is_enabled():
+                    bouton.first.click()
+                else:
+                    page.keyboard.press("Enter")
+                try:
+                    page.wait_for_function(
+                        "([s, n]) => document.querySelectorAll(s).length > n",
+                        arg=[SEL_MSG_USAGER, avant], timeout=15_000)
+                except PWTimeout:
+                    res.update(ok=False, etape="envoi", url=page.url,
+                               capture_jpeg=_capture(page),
+                               error="phrase tapée mais jamais apparue dans "
+                                     "la conversation")
+                    return
+
+                etat["dernier_succes"] = datetime.datetime.now(
+                    datetime.timezone.utc).isoformat(timespec="seconds")
+                _chatgpt_ecrire_etat(etat)
+                res.update(ok=True, etape="envoye", url=page.url,
+                           messages_usager=avant + 1,
+                           message=CFG["chatgpt_message"],
+                           hotes_bloques=bloquees)
+                envoye.set()
+
+                # Garder ouvert pendant que ChatGPT travaille. Deux constats
+                # « bouton arrêter absent » de suite = vraiment fini (entre
+                # deux appels d'outils, il disparaît un instant).
+                limite = time.monotonic() + CFG["chatgpt_garder_min"] * 60
+                page.wait_for_timeout(10_000)
+                calme = 0
+                while time.monotonic() < limite and calme < 2:
+                    calme = calme + 1 if page.locator(SEL_ARRETER).count() == 0 else 0
+                    page.wait_for_timeout(20_000)
+                print("[chatgpt] page fermée ("
+                      + ("fin du travail" if calme >= 2 else "limite atteinte") + ")",
+                      file=sys.stderr)
+            finally:
+                nav.close()
+    except Exception as e:  # noqa: BLE001 - l'erreur remonte au VPS, jamais muette
+        if "ok" not in res:
+            res.update(ok=False, etape="exception",
+                       error=f"{type(e).__name__}: {e}")
+        print(f"[chatgpt] {type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        envoye.set()
+        _CHATGPT_VERROU.release()
+
+
+def chatgpt_demarre() -> tuple[int, dict]:
+    """(code HTTP, corps). 4xx = la demande est refusée ; 200 = la tentative a
+    eu lieu, `ok` dit si la phrase est partie."""
+    if not conversation_valide(CFG["chatgpt_conversation"]):
+        return 412, {"error": "option chatgpt_conversation absente ou invalide "
+                              "(https://chatgpt.com/...)"}
+    if not CFG["chatgpt_message"]:
+        return 412, {"error": "option chatgpt_message vide"}
+    attente = trop_tot(_chatgpt_lire_etat().get("dernier_succes", ""),
+                       CFG["chatgpt_intervalle_min"], time.time())
+    if attente:
+        return 429, {"error": f"déjà envoyé récemment — réessayer dans {attente} s"}
+    if not _CHATGPT_VERROU.acquire(blocking=False):
+        return 409, {"error": "une session ChatGPT est déjà ouverte"}
+    res: dict = {}
+    envoye = threading.Event()
+    threading.Thread(target=_chatgpt_session, args=(res, envoye),
+                     daemon=True).start()
+    # Sous les 100 s de Cloudflare : goto 40 + composeur 25 + envoi 15 + marge.
+    if not envoye.wait(timeout=88):
+        return 200, {"ok": False, "etape": "attente",
+                     "error": "toujours en cours après 88 s"}
+    return 200, dict(res)
+
+
+# --------------------------------------------------------------------------- #
 # Serveur HTTP
 # --------------------------------------------------------------------------- #
 
@@ -582,12 +857,26 @@ class Handler(BaseHTTPRequestHandler):
                 # savoir depuis le VPS (le proxy Supervisor de HA refuse les
                 # jetons longue durée). Dit aussi si Chromium est bien là.
                 "arch": platform.machine(),
-                "verbes": ["/fetch"] + (["/render"] if CFG["render_enabled"] else []),
+                "verbes": ["/fetch"] + (["/render", "/chatgpt_demarre"]
+                                      if CFG["render_enabled"] else []),
             })
             return
 
         if parsed.path == "/render":
             self._route_render(qs)
+            return
+
+        if parsed.path == "/chatgpt_demarre":
+            # Pas d'URL ici : seul le jeton porteur s'applique. La cible est
+            # une OPTION de l'add-on, jamais un paramètre (voir la section).
+            if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
+                self._json(401, {"error": "jeton invalide"})
+                return
+            if not CFG["render_enabled"]:
+                self._json(503, {"error": "navigateur désactivé (option render_enabled)"})
+                return
+            code, corps = chatgpt_demarre()
+            self._json(code, corps)
             return
 
         if parsed.path != "/fetch":

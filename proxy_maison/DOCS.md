@@ -59,3 +59,24 @@ encore, `/render` répondra 501.
 
 Le repo pousse une nouvelle `version:` → Home Assistant affiche « Mise à jour
 disponible » → un bouton. Pas de copier-coller.
+
+## ChatGPT : la phrase quotidienne (`/chatgpt_demarre`, 2.8.0)
+
+Une fois par jour, le VPS dit « vas-y » et l'add-on tape `chatgpt_message`
+(par défaut « fait prochaine sur le mcp carcajou ») dans ta conversation
+ChatGPT. Le VPS ne choisit ni le texte ni la conversation : ce sont les options
+ci-dessous, réglées ici seulement.
+
+1. **La conversation** : ouvre-la dans ton navigateur et copie son adresse
+   (`https://chatgpt.com/c/...`) dans `chatgpt_conversation`. Vide = verbe fermé.
+2. **La connexion** : dans TON Chrome connecté à chatgpt.com, extension
+   **Cookie-Editor** → **Export** → **JSON**, et colle le tout dans
+   `chatgpt_cookies`. Seuls les témoins de chatgpt.com et openai.com sont
+   retenus. Ils ne sont réinjectés que si tu changes l'option : le profil Chrome
+   de l'add-on garde ensuite sa session tout seul.
+3. **Redémarre l'add-on** (les options ne sont lues qu'au démarrage).
+
+`chatgpt_intervalle_min` (60) refuse un 2ᵉ envoi trop rapproché.
+`chatgpt_garder_min` (120) borne le temps où la page reste ouverte pendant que
+ChatGPT travaille. Si la session expire, le VPS t'envoie un push : recolle les
+témoins et redémarre l'add-on.
