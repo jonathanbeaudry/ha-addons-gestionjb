@@ -4,7 +4,7 @@
 # (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
 # remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
 name: Proxy maison (sortie résidentielle)
-version: "2.10.0"
+version: "2.10.1"
 slug: proxy_maison
 description: >-
   Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
@@ -22,6 +22,13 @@ host_network: true
 # `manager` est le plus petit rôle qui permet /host/reboot. Voir fetch_server.py,
 # section « Relancer Home Assistant à distance ».
 hassio_api: true
+# 2.10.1 : chien de garde du Supervisor. L'add-on est tombé le 2026-10-08 (/render
+# instable dès 21 h 23, mort à 21 h 56) et personne ne l'a relevé pendant 9 h (Les Libraires, StoryGraph et la
+# vitrine de Boussole morts) : l'interrupteur « Watchdog » était à off — mis à on
+# le 2026-10-09 par l'API du Supervisor. Cette URL lui permet en plus de voir un
+# serveur FIGÉ (processus vivant, port muet), pas seulement un conteneur arrêté.
+# /health répond 200 sans jeton.
+watchdog: "http://[HOST]:[PORT:8099]/health"
 hassio_role: manager
 init: false
 options:
