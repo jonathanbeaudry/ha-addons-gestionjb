@@ -88,14 +88,6 @@ PLATFORMS = COORDINATOR_AWARE_PLATFORMS + [
 # Suffixes used when building gateway-attached entity unique_ids in sensor.py
 # (e.g. f"{device.identifier.lower()}-{suffix}"). Used to migrate those
 # unique_ids when the gateway's identifier changes from DSN-based to MAC-based.
-class _API2(API):
-    """hilo2 : son propre fichier de jetons (la librairie le fixe à hilo_state.yaml)."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._state_yaml = "hilo2_state.yaml"
-
-
 GATEWAY_ENTITY_SUFFIXES = [
     "defi_hilo",
     "recompenses_hilo",
@@ -215,7 +207,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     current_options = {**entry.options}
 
     try:
-        api = await _API2.async_create(
+        api = await API.async_create(
             session=async_create_clientsession(
                 hass, cookie_jar=CookieJar(quote_cookie=False)
             ),
@@ -223,6 +215,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass, entry, implementation
             ),
             log_traces=current_options.get(CONF_LOG_TRACES, DEFAULT_LOG_TRACES),
+            state_yaml=hass.config.path("hilo2_state.yaml"),
         )
 
     except (TimeoutError, client_exceptions.ClientConnectorError):
