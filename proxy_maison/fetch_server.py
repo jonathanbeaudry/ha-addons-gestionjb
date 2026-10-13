@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.4"
+SERVICE_VERSION = "2.10.5"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -618,6 +618,7 @@ SERVICES = {
 }
 
 _VERROUS = {s: threading.Lock() for s in SERVICES}
+IMMOBILE_MAX_S = 15 * 60       # sans un caractère de plus : on rend la main
 _DERNIERE: dict = {}          # service -> dernier état connu de l'échange
 
 
@@ -868,6 +869,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 limite = time.monotonic() + CFG["navigateur_garder_min"] * 60
                 debut = time.monotonic()
                 precedent, stable = None, 0
+                bouge = time.monotonic()
                 while time.monotonic() < limite:
                     page.wait_for_timeout(3000 if time.monotonic() - debut < 120
                                           else 15000)
@@ -878,14 +880,22 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                     _DERNIERE[service] = {"texte": texte[:500], "reponse": rep[:20000],
                                           "fini": False, "quand": quand}
                     stable = stable + 1 if (rep and rep == precedent and not occupe) else 0
+                    if rep != precedent:
+                        bouge = time.monotonic()
                     precedent = rep
+                    # Une réponse qui ne bouge plus (ou qu'on lit vide) alors
+                    # que le site se dit occupé : vu le 2026-10-13, la page
+                    # restait ouverte pour rien et bloquait la phrase suivante.
+                    if time.monotonic() - bouge > IMMOBILE_MAX_S:
+                        break
                     if stable >= 2:
                         res["fini"] = True
                         _DERNIERE[service]["fini"] = True
                         break
                 termine.set()
                 print(f"[navigateur] {service} : page fermée ("
-                      + ("réponse finie" if res.get("fini") else "limite atteinte")
+                      + ("réponse finie" if res.get("fini")
+                         else "plus de mouvement ou limite atteinte")
                       + ")", file=sys.stderr)
             finally:
                 nav.close()
