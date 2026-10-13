@@ -60,30 +60,48 @@ encore, `/render` répondra 501.
 Le repo pousse une nouvelle `version:` → Home Assistant affiche « Mise à jour
 disponible » → un bouton. Pas de copier-coller.
 
-## ChatGPT et Grok : parler par la maison (`/navigateur_dire`, 2.9.0)
+## Les sites connectés (option `sites`, 2.11.0)
 
-Le VPS envoie une phrase à ChatGPT ou à Grok ; l'add-on la tape dans la
-conversation réglée ICI et rapporte la réponse. Le VPS choisit le service et le
-texte, jamais la conversation ni le compte. Chaque jour à 21 h 05, il envoie le
-message par défaut de ChatGPT (« fait prochaine sur le mcp carcajou »).
+Une ligne par site où le VPS doit entrer avec TON compte :
 
-1. **Les conversations** : `chatgpt_conversation` = l'adresse de ta
-   conversation avec Carcajou (`https://chatgpt.com/c/...`).
-   `grok_conversation` = `https://grok.com/` (un nouveau fil à chaque phrase)
-   ou l'adresse d'un fil précis. `muse_conversation` = `https://muse.ai/`.
-   Vide = service fermé.
-2. **La connexion** : dans TON Chrome connecté au site, extension
-   **Cookie-Editor** → **Export** → **JSON**, et colle le tout dans
-   `chatgpt_cookies` (sur chatgpt.com), `grok_cookies` (sur grok.com) ou
-   `muse_cookies` (sur muse.ai). Seuls
-   les témoins du bon site sont retenus. Ils ne sont réinjectés que si tu
-   changes l'option : le profil Chrome de l'add-on garde ensuite sa session.
-3. **Redémarre l'add-on** (les options ne sont lues qu'au démarrage).
+```yaml
+sites:
+  - url: https://exemple.com/        # une page du site
+    cookies: '[ ... ]'               # l'export JSON de Cookie-Editor
+    clic: false                      # true = le VPS peut aussi cliquer
+```
+
+1. **L'adresse** : n'importe quelle page du site, en `https`. Elle dit quel
+   site est visé ; ses sous-domaines suivent.
+2. **La connexion** : dans TON navigateur connecté au site, extension
+   **Cookie-Editor** → **Export** → **JSON**, et colle le tout dans `cookies`.
+   Seuls les témoins de ce site sont retenus. Ils ne sont reposés que si tu
+   changes la ligne : le profil Chrome de l'add-on garde ensuite sa session.
+3. **Lire ou cliquer** : sans `clic: true`, le VPS lit les pages et ne clique
+   nulle part.
+4. **Redémarre l'add-on** (les options ne sont lues qu'au démarrage).
+
+Dès lors, `/render` sur une adresse du site s'ouvre connecté. Chaque rendu
+connecté laisse une ligne dans `/data/navigateur_journal.jsonl`.
+
+## ChatGPT, Grok et Muse : parler par la maison (`/navigateur_dire`)
+
+Le VPS envoie une phrase ; l'add-on la tape dans la conversation réglée ICI et
+rapporte la réponse. Le VPS choisit le service et le texte, jamais la
+conversation ni le compte. Ces trois services sont des lignes de `sites` comme
+les autres, avec deux particularités :
+
+- `url` est la **conversation** où la phrase est tapée : l'adresse de ta
+  conversation avec Carcajou (`https://chatgpt.com/c/...`), ou la racine
+  (`https://grok.com/`, `https://muse.ai/`) pour un nouveau fil à chaque phrase.
+  Pas de ligne = service fermé.
+- `message` est ce qui part quand le VPS n'envoie pas de texte : chaque jour à
+  21 h 05, celui de ChatGPT (« fait prochaine sur le mcp carcajou »).
 
 `navigateur_garder_min` (120) borne le temps où la page reste ouverte pendant
 qu'un service travaille. Chaque phrase est notée dans
 `/data/navigateur_journal.jsonl`. Si une session expire, le VPS t'envoie un
-push : recolle les témoins et redémarre l'add-on.
+push : recolle les témoins sur sa ligne et redémarre l'add-on.
 
 ## Relancer Home Assistant à distance (2.10.0)
 

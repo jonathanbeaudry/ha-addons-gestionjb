@@ -4,7 +4,7 @@
 # (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
 # remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
 name: Proxy maison (sortie résidentielle)
-version: "2.10.9"
+version: "2.11.0"
 slug: proxy_maison
 description: >-
   Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
@@ -46,17 +46,21 @@ options:
   # laisse /fetch (la production : Reddit, Morningstar) debout.
   render_enabled: true
   render_timeout: 45
-  # /navigateur_dire (2.9.0) : le VPS envoie une phrase à ChatGPT ou à Grok,
-  # dans LA conversation réglée ici (jamais choisie par le VPS). Conversation
-  # vide = service fermé. Les témoins = export JSON de l'extension
-  # Cookie-Editor, depuis ton propre Chrome connecté au site.
-  chatgpt_conversation: ""
-  chatgpt_message: "fait prochaine sur le mcp carcajou"
-  chatgpt_cookies: ""
-  grok_conversation: "https://grok.com/"
-  grok_cookies: ""
-  muse_conversation: "https://muse.ai/"
-  muse_cookies: ""
+  # Les sites connectés (2.11.0) : une ligne par site. `url` = une page du
+  # site ; `cookies` = l'export JSON de l'extension Cookie-Editor, depuis ton
+  # propre navigateur connecté au site ; `clic: true` = le VPS peut aussi
+  # cliquer dans la page (sinon il lit seulement). /render sur une adresse du
+  # site s'ouvre alors connecté. Pour ChatGPT, Grok et Muse, `url` est aussi
+  # la conversation où /navigateur_dire tape, et `message` ce qu'il tape quand
+  # le VPS n'envoie pas de texte.
+  sites:
+    - url: "https://chatgpt.com/"
+      clic: true
+      message: "fait prochaine sur le mcp carcajou"
+    - url: "https://grok.com/"
+      clic: true
+    - url: "https://muse.ai/"
+      clic: true
   navigateur_garder_min: 120
   # /ha_redemarrer (2.10.0) : coupe-circuit de la relance de HA à distance.
   redemarrage_ha: true
@@ -68,14 +72,10 @@ schema:
   port: port
   render_enabled: bool
   render_timeout: int(5,180)
-  chatgpt_conversation: str?
-  chatgpt_message: str?
-  chatgpt_cookies: password?
-  grok_conversation: str?
-  grok_message: str?
-  grok_cookies: password?
-  muse_conversation: str?
-  muse_message: str?
-  muse_cookies: password?
+  sites:
+    - url: url
+      cookies: password?
+      clic: bool?
+      message: str?
   navigateur_garder_min: int(1,600)
   redemarrage_ha: bool?

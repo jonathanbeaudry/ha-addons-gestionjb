@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.9"
+SERVICE_VERSION = "2.11.0"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -148,17 +148,9 @@ def _charger_config() -> dict:
         "render_enabled": os.environ.get("RENDER_ENABLED", "true").lower()
         not in ("0", "false", "no"),
         "render_timeout": int(os.environ.get("RENDER_TIMEOUT", "45")),
-        # /navigateur_dire — voir la section du même nom. Conversation vide =
-        # service fermé.
-        "chatgpt_conversation": "",
-        "chatgpt_message": "fait prochaine sur le mcp carcajou",
-        "chatgpt_cookies": "",
-        "grok_conversation": "https://grok.com/",
-        "grok_message": "",
-        "grok_cookies": "",
-        "muse_conversation": "https://muse.ai/",
-        "muse_message": "",
-        "muse_cookies": "",
+        # Les sites connectés (option `sites`) — voir « Les sites connectés ».
+        # Les défauts vivent dans config.yaml, seul endroit.
+        "sites": [],
         "navigateur_garder_min": 120,
         "redemarrage_ha": True,
     }
@@ -184,12 +176,8 @@ def _charger_config() -> dict:
                 cfg["render_enabled"] = bool(opts["render_enabled"])
             if opts.get("render_timeout"):
                 cfg["render_timeout"] = int(opts["render_timeout"])
-            for cle in ("chatgpt_conversation", "chatgpt_message",
-                        "chatgpt_cookies", "grok_conversation",
-                        "grok_message", "grok_cookies",
-                        "muse_conversation", "muse_message", "muse_cookies"):
-                if opts.get(cle):
-                    cfg[cle] = str(opts[cle]).strip()
+            if isinstance(opts.get("sites"), list):
+                cfg["sites"] = opts["sites"]
             if "redemarrage_ha" in opts:
                 cfg["redemarrage_ha"] = bool(opts["redemarrage_ha"])
             if opts.get("navigateur_garder_min") is not None:
@@ -420,7 +408,7 @@ def _garder_anti_ssrf(ctx, bloquees: list) -> None:
 
 def _render(url: str, referer: str = "", attendre: str = "",
             selecteur: str = "", capture: str = "", clic: str = "",
-            clic_n: int = 1, profil: str = "") -> dict:
+            clic_n: int = 1, profil: str = "", site: dict | None = None) -> dict:
     """Ouvre `url` dans Chromium, laisse tourner le JS, rend le DOM final.
 
     Un navigateur NEUF par appel : plus lent (~1-3 s de démarrage) qu'un
@@ -443,6 +431,10 @@ def _render(url: str, referer: str = "", attendre: str = "",
     « fraîcheur » du navigateur (reCAPTCHA de Waze), une session habituée passe
     là où un navigateur tout neuf se fait montrer la porte. Sans profil, on
     garde le navigateur jetable — zéro état qui fuit entre deux appels.
+
+    `site` : la ligne de l'option `sites` qui couvre `url` (voir « Les sites
+    connectés »). Son profil s'impose et ses témoins y sont posés : la page
+    s'ouvre connectée au compte de Jonathan.
     """
     # Import PARESSEUX : /fetch ne doit jamais dépendre de Chromium (voir le
     # docstring en tête). Un add-on sans navigateur sert encore /fetch.
@@ -455,7 +447,8 @@ def _render(url: str, referer: str = "", attendre: str = "",
     _CACHE_HOTES.clear()
 
     with sync_playwright() as pw:
-        nav, ctx, mode_nav = _ouvrir_navigateur(pw, profil)
+        nav, ctx, mode_nav = _ouvrir_navigateur(
+            pw, site["profil"] if site else profil)
         try:
             # Socle stealth : injecté AVANT toute navigation, sur chaque page.
             try:
@@ -464,6 +457,7 @@ def _render(url: str, referer: str = "", attendre: str = "",
                 pass
 
             _garder_anti_ssrf(ctx, bloquees)
+            temoins_poses = _poser_temoins(ctx, site) if site else False
             page = ctx.new_page()
             # playwright-stealth EN PLUS du socle maison (best-effort, jamais
             # fatal) — la 3ᵉ couche de « fait les 3 ».
@@ -541,6 +535,8 @@ def _render(url: str, referer: str = "", attendre: str = "",
                     # Quelle voie a servi (chrome-graphique / chromium-headless) :
                     # au VPS de savoir si l'humanisation a bien pris, sans deviner.
                     "navigateur": mode_nav,
+                    "site": site["profil"] if site else "",
+                    "cookies_reinjectes": temoins_poses,
                     # Remonté au VPS : une page amputée de ressources bloquées
                     # doit être explicable, jamais un mystère silencieux.
                     "hotes_bloques": bloquees}
@@ -559,8 +555,8 @@ def _render(url: str, referer: str = "", attendre: str = "",
 #     [Ti-Coq] qui lances une phrase d'ici ».
 #
 # Ce que le VPS peut choisir : le SERVICE (liste fermée ci-dessous) et le
-# TEXTE. Ce qu'il ne choisit JAMAIS : la conversation (option de l'add-on) ni
-# le compte (témoins collés en option par Jonathan). Le texte libre est un
+# TEXTE. Ce qu'il ne choisit JAMAIS : la conversation (l'adresse de la ligne du
+# site dans l'option `sites`) ni le compte (ses témoins, même ligne). Le texte libre est un
 # geste explicite de Jonathan ; avant lui, seul le texte en option partait.
 #
 # ⚠️ Conditions d'utilisation : OpenAI et xAI n'autorisent pas le pilotage de
@@ -569,10 +565,7 @@ def _render(url: str, referer: str = "", attendre: str = "",
 # (Jonathan, 2026-10-13 : « c'est inutile ») — la boucle des lots Carcajou en
 # envoie autant qu'il reste de lots.
 #
-# La connexion : un profil Chrome PERSISTANT par service sous /data, amorcé par
-# les témoins exportés de SON Chrome (extension Cookie-Editor → Export JSON) et
-# collés dans `<service>_cookies`. Réinjectés seulement quand l'option CHANGE :
-# sinon on écraserait la session que le profil a rafraîchie lui-même.
+# La connexion : voir « Les sites connectés » plus bas.
 
 NAV_DIR = "/data"
 NAV_JOURNAL = os.path.join(NAV_DIR, "navigateur_journal.jsonl")
@@ -643,15 +636,103 @@ SERVICES = {
     },
 }
 
-_VERROUS = {s: threading.Lock() for s in SERVICES}
+_VERROUS: dict = {}           # profil -> verrou : un profil Chrome, un seul
+_VERROUS_GARDE = threading.Lock()       # navigateur à la fois
+
+
+def _verrou(profil: str) -> threading.Lock:
+    with _VERROUS_GARDE:
+        return _VERROUS.setdefault(profil, threading.Lock())
 IMMOBILE_MAX_S = 15 * 60       # sans un caractère de plus : on rend la main
 _DERNIERE: dict = {}          # service -> dernier état connu de l'échange
 
 
-def conversation_valide(service: str, url: str) -> bool:
-    """Une page du site du service, en https, hôte exact — rien d'autre."""
-    p = urllib.parse.urlparse(url or "")
-    return p.scheme == "https" and p.hostname in SERVICES[service]["hotes"]
+# --------------------------------------------------------------------------- #
+# Les sites connectés — l'option `sites`
+# --------------------------------------------------------------------------- #
+#
+# Jonathan, 2026-10-13 : « je mets l'URL et le json et tu y as accès direct ».
+# Une ligne par site : `url` (une page du site, en https), `cookies` (l'export
+# JSON de l'extension Cookie-Editor, depuis SON navigateur connecté) et `clic`.
+# Chaque site a son profil Chrome PERSISTANT sous /data ; les témoins n'y sont
+# reposés que quand la ligne CHANGE, sinon on écraserait la session que le
+# profil a rafraîchie lui-même.
+#
+# /render sur une adresse d'un de ces sites s'ouvre connecté, sans rien
+# demander de plus. Il LIT ; il ne clique que si la ligne dit `clic: true`.
+# Les services de SERVICES passent par la même liste : leur ligne donne en
+# plus la conversation de /navigateur_dire et son `message` par défaut.
+
+def sites_configures(entrees: list) -> list[dict]:
+    """L'option `sites` → les sites connectés. Une ligne illisible est sautée
+    en le disant ; deux lignes pour le même site : la première gagne."""
+    sites: list[dict] = []
+    for e in entrees or []:
+        if not isinstance(e, dict):
+            continue
+        url = str(e.get("url") or "").strip()
+        p = urllib.parse.urlparse(url)
+        hote = (p.hostname or "").lower()
+        if p.scheme != "https" or "." not in hote:
+            print(f"[sites] ligne ignorée (adresse https attendue) : {url[:80]!r}",
+                  file=sys.stderr)
+            continue
+        service = next((n for n, sv in SERVICES.items() if hote in sv["hotes"]), "")
+        if service:
+            profil = service
+            domaines = tuple(SERVICES[service]["domaines_cookies"])
+        else:
+            domaine = hote[4:] if hote.startswith("www.") else hote
+            profil = re.sub(r"[^a-z0-9]+", "-", domaine).strip("-")[:32]
+            domaines = (domaine,)
+        if any(s["profil"] == profil for s in sites):
+            print(f"[sites] ligne ignorée (site déjà présent) : {profil}",
+                  file=sys.stderr)
+            continue
+        sites.append({"profil": profil, "url": url, "domaines": domaines,
+                      "cookies": str(e.get("cookies") or "").strip(),
+                      "clic": bool(e.get("clic")),
+                      "message": str(e.get("message") or "").strip()})
+    return sites
+
+
+SITES = sites_configures(CFG["sites"])
+
+
+def site_pour(hote: str) -> dict | None:
+    """Le site connecté qui couvre cet hôte (lui ou un sous-domaine), ou None.
+    Deux sites emboîtés : le plus précis gagne."""
+    hote = (hote or "").lower()
+    trouves = [(len(d), s) for s in SITES for d in s["domaines"]
+               if hote == d or hote.endswith("." + d)]
+    return max(trouves, key=lambda t: t[0])[1] if trouves else None
+
+
+def site_du_profil(profil: str) -> dict | None:
+    return next((s for s in SITES if s["profil"] == profil), None)
+
+
+def juger_rendu(url: str, profil: str, clic: str) -> tuple[dict | None, int, str]:
+    """Ce /render peut-il avoir lieu ? (site, code, erreur) — code 0 = oui,
+    `site` étant la ligne qui couvre `url` (None : page ordinaire).
+
+    Un site connecté impose son profil et ne se laisse cliquer que si sa ligne
+    le permet. Un profil qui porte (ou peut porter) une session de Jonathan ne
+    s'ouvre jamais hors de son site."""
+    cible = urllib.parse.urlparse(url)
+    site = site_pour(cible.hostname or "")
+    if not site:
+        if profil in SERVICES or site_du_profil(profil):
+            return None, 403, f"le profil {profil} ne s'ouvre que sur son site"
+        return None, 0, ""
+    if cible.scheme != "https":
+        return site, 400, "site connecté : https seulement"
+    if profil and profil != site["profil"]:
+        return site, 400, f"ce site a son profil : {site['profil']}"
+    if clic and not site["clic"]:
+        return site, 403, (f"{site['profil']} est en lecture seule "
+                           "(clic: false sur sa ligne de l'option sites)")
+    return site, 0, ""
 
 
 def cookies_pour_playwright(brut: str, domaines: tuple) -> list[dict]:
@@ -675,7 +756,12 @@ def cookies_pour_playwright(brut: str, domaines: tuple) -> list[dict]:
             continue
         domaine = str(c.get("domain", "")).lower()
         hote = domaine.lstrip(".")
-        if not any(hote == d or hote.endswith("." + d) for d in domaines):
+        # Le témoin est du site, d'un de ses sous-domaines, ou d'un domaine
+        # parent (un site « app.exemple.com » garde sa session sur
+        # « .exemple.com ») — jamais d'un suffixe nu comme « com ».
+        if not any(hote == d or hote.endswith("." + d)
+                   or ("." in hote and d.endswith("." + hote))
+                   for d in domaines):
             continue
         ck = {"name": str(c["name"]), "value": str(c["value"]),
               "domain": domaine, "path": c.get("path") or "/",
@@ -725,22 +811,36 @@ def _journaliser(entree: dict) -> None:
         print(f"[navigateur] journal non écrit : {e}", file=sys.stderr)
 
 
-def _etat_cookies(service: str) -> dict:
+def _etat_cookies(profil: str) -> dict:
     try:
-        with open(os.path.join(NAV_DIR, f"navigateur_{service}.json"),
+        with open(os.path.join(NAV_DIR, f"navigateur_{profil}.json"),
                   encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def _noter_cookies(service: str, empreinte: str) -> None:
+def _noter_cookies(profil: str, empreinte: str) -> None:
     try:
-        with open(os.path.join(NAV_DIR, f"navigateur_{service}.json"), "w",
+        with open(os.path.join(NAV_DIR, f"navigateur_{profil}.json"), "w",
                   encoding="utf-8") as f:
             json.dump({"cookies_sha": empreinte}, f)
     except OSError as e:
         print(f"[navigateur] état non écrit : {e}", file=sys.stderr)
+
+
+def _poser_temoins(ctx, site: dict) -> bool:
+    """Pose les témoins de la ligne dans son profil — seulement s'ils ont
+    changé depuis la dernière pose. Vrai s'ils viennent d'être posés."""
+    brut = site["cookies"]
+    if not brut:
+        return False
+    empreinte = hashlib.sha256(brut.encode()).hexdigest()
+    if empreinte == _etat_cookies(site["profil"]).get("cookies_sha"):
+        return False
+    ctx.add_cookies(cookies_pour_playwright(brut, site["domaines"]))
+    _noter_cookies(site["profil"], empreinte)
+    return True
 
 
 def _capture(page) -> str:
@@ -812,6 +912,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
     `navigateur_garder_min` minutes : fermer en plein travail ne doit pas
     pouvoir couper une boucle d'outils de ChatGPT."""
     sv = SERVICES[service]
+    site = site_du_profil(service)
     quand = datetime.datetime.now().isoformat(timespec="seconds")
     try:
         from playwright.sync_api import TimeoutError as PWTimeout
@@ -828,16 +929,12 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 bloquees: list = []
                 _garder_anti_ssrf(ctx, bloquees)
 
-                brut = CFG[f"{service}_cookies"]
-                empreinte = hashlib.sha256(brut.encode()).hexdigest() if brut else ""
-                if brut and empreinte != _etat_cookies(service).get("cookies_sha"):
-                    ctx.add_cookies(cookies_pour_playwright(brut, sv["domaines_cookies"]))
-                    _noter_cookies(service, empreinte)
+                if _poser_temoins(ctx, site):
                     res["cookies_reinjectes"] = True
 
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 _stealth_lib(ctx, page)
-                page.goto(CFG[f"{service}_conversation"],
+                page.goto(site["url"],
                           wait_until="domcontentloaded", timeout=40_000)
                 try:
                     page.wait_for_selector(sv["composeur"], timeout=25_000)
@@ -846,7 +943,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                     res.update(ok=False, etape="composeur", url=page.url,
                                capture_jpeg=_capture(page),
                                error=(f"pas connecté à {service} : recoller les "
-                                      f"témoins dans l'option {service}_cookies")
+                                      "témoins dans sa ligne de l'option sites")
                                if deconnecte else
                                "zone de saisie introuvable (le site a changé ?)")
                     return
@@ -977,7 +1074,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
             _journaliser({"quand": quand, "service": service, "ok": False,
                           "texte": texte[:500], "erreur": res.get("error", "")})
         termine.set()
-        _VERROUS[service].release()
+        _verrou(service).release()
 
 
 def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
@@ -986,14 +1083,15 @@ def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
     (sinon /navigateur_lire la donnera plus tard)."""
     if service not in SERVICES:
         return 400, {"error": f"service inconnu (permis : {', '.join(SERVICES)})"}
-    if not conversation_valide(service, CFG[f"{service}_conversation"]):
-        return 412, {"error": f"option {service}_conversation absente ou invalide"}
-    texte = (texte or CFG.get(f"{service}_message") or "").strip()
+    site = site_du_profil(service)
+    if not site:
+        return 412, {"error": f"aucune ligne pour {service} dans l'option sites"}
+    texte = (texte or site["message"]).strip()
     if not texte:
-        return 400, {"error": "texte vide (et aucun message par défaut en option)"}
+        return 400, {"error": "texte vide (et aucun message par défaut sur sa ligne)"}
     if len(texte) > TEXTE_MAX:
         return 413, {"error": f"texte trop long (> {TEXTE_MAX} caractères)"}
-    if not _VERROUS[service].acquire(blocking=False):
+    if not _verrou(service).acquire(blocking=False):
         return 409, {"error": f"{service} travaille encore sur la phrase précédente "
                               "(voir /navigateur_lire)"}
     res: dict = {}
@@ -1020,7 +1118,7 @@ def navigateur_lire(service: str) -> tuple[int, dict]:
     if not d:
         return 404, {"error": "aucun échange en mémoire depuis le démarrage"}
     return 200, {"ok": True, "service": service,
-                 "en_cours": _VERROUS[service].locked(), **d}
+                 "en_cours": _verrou(service).locked(), **d}
 
 
 # --------------------------------------------------------------------------- #
@@ -1231,7 +1329,7 @@ class Handler(BaseHTTPRequestHandler):
                 # savoir depuis le VPS (le proxy Supervisor de HA refuse les
                 # jetons longue durée). Dit aussi si Chromium est bien là.
                 "arch": platform.machine(),
-                "verbes": ["/fetch"] + (["/render", "/navigateur_dire",
+                "verbes": ["/fetch"] + (["/render", "/sites", "/navigateur_dire",
                                        "/navigateur_lire"]
                                       if CFG["render_enabled"] else [])
                           + ["/ha_etat", "/ha_journal", "/ha_redemarrer"],
@@ -1254,6 +1352,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/render":
             self._route_render(qs)
+            return
+
+        if parsed.path == "/sites":
+            # Ce que le VPS peut ouvrir connecté — jamais les témoins.
+            if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
+                self._json(401, {"error": "jeton invalide"})
+                return
+            self._json(200, {"ok": True, "sites": [
+                {"site": s["profil"], "url": s["url"],
+                 "domaines": list(s["domaines"]), "clic": s["clic"],
+                 "temoins": bool(s["cookies"]),
+                 "dire": s["profil"] in SERVICES} for s in SITES]})
             return
 
         if parsed.path in ("/navigateur_dire", "/navigateur_lire"):
@@ -1333,6 +1443,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "profil invalide ([a-z0-9_-]{1,32})"})
             return
 
+        # Un site connecté : son profil s'impose, et on n'y clique que si sa
+        # ligne le permet. Hors de son site, ce profil ne s'ouvre pas.
+        clic = (qs.get("clic") or [""])[0]
+        site, code, erreur = juger_rendu(target, profil, clic)
+        if code:
+            self._json(code, {"error": erreur})
+            return
+        if site:
+            verrou = _verrou(site["profil"])
+            if not verrou.acquire(blocking=False):
+                self._json(409, {"error": f"{site['profil']} est déjà ouvert "
+                                          "(une phrase ou un autre rendu en cours)"})
+                return
+
         try:
             clic_n = (qs.get("clic_n") or ["1"])[0]
             res = _render(
@@ -1341,9 +1465,10 @@ class Handler(BaseHTTPRequestHandler):
                 attendre=(qs.get("wait") or [""])[0],
                 selecteur=(qs.get("selector") or [""])[0],
                 capture=(qs.get("capture") or [""])[0],
-                clic=(qs.get("clic") or [""])[0],
+                clic=clic,
                 clic_n=int(clic_n) if clic_n.isdigit() else 1,
                 profil=profil,
+                site=site,
             )
         except ImportError as e:
             # Chromium absent de l'image : /fetch marche encore, on le dit sans
@@ -1353,6 +1478,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001 - erreur propre au VPS
             self._json(502, {"error": f"échec render: {type(e).__name__}: {e}"})
             return
+        finally:
+            if site:
+                verrou.release()
+                _journaliser({"quand": datetime.datetime.now().isoformat(
+                                  timespec="seconds"),
+                              "site": site["profil"], "rendu": target[:500],
+                              "clic": clic[:200]})
 
         self._json(200, res)
 
