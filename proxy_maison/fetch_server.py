@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.8"
+SERVICE_VERSION = "2.10.9"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -598,6 +598,7 @@ SERVICES = {
         # « arrêter », qui n'a plus de repère.
         "tour": "data-turn-key",
         "tour_fini": '[data-talvt-turn-state="complete"]',
+        "pret": "",
         "saisie": "",
         "connexion": '[data-testid="login-button"]',
     },
@@ -616,6 +617,7 @@ SERVICES = {
         # ses libellés (« Envoyer »…) finissent collés à la réponse.
         "tour": "",
         "tour_fini": "",
+        "pret": "",
         "saisie": 'form[data-composer="true"]',
         "connexion": 'a[href*="sign-in"]',
     },
@@ -632,6 +634,10 @@ SERVICES = {
         "reponses": "",
         "tour": "",
         "tour_fini": "",
+        # À l'ouverture, l'agent « est en train de se préparer » ; une phrase
+        # tapée à ce moment-là part en « Diffusion non confirmée » et se perd
+        # quand la page se recharge (vu le 2026-10-13). On attend « Connecté ».
+        "pret": "text=/Connecté|Connected/",
         "saisie": "form",
         "connexion": 'input[type="tel"], input[type="email"], input[name="email"]',
     },
@@ -845,6 +851,16 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                                "zone de saisie introuvable (le site a changé ?)")
                     return
 
+                if sv["pret"]:
+                    try:
+                        page.wait_for_selector(sv["pret"], timeout=150_000)
+                    except PWTimeout:
+                        res.update(ok=False, etape="pas_pret", url=page.url,
+                                   capture_jpeg=_capture(page),
+                                   error=f"{service} n'était toujours pas prêt "
+                                         "après 150 s")
+                        return
+                    page.wait_for_timeout(1500)
                 cle = texte.strip()[:200]
                 if sv["tour"]:
                     # Chrome à froid : la saisie arrive avant l'historique.
