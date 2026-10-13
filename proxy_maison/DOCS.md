@@ -70,10 +70,12 @@ message par défaut de ChatGPT (« fait prochaine sur le mcp carcajou »).
 1. **Les conversations** : `chatgpt_conversation` = l'adresse de ta
    conversation avec Carcajou (`https://chatgpt.com/c/...`).
    `grok_conversation` = `https://grok.com/` (un nouveau fil à chaque phrase)
-   ou l'adresse d'un fil précis. Vide = service fermé.
+   ou l'adresse d'un fil précis. `muse_conversation` = `https://muse.ai/`.
+   Vide = service fermé.
 2. **La connexion** : dans TON Chrome connecté au site, extension
    **Cookie-Editor** → **Export** → **JSON**, et colle le tout dans
-   `chatgpt_cookies` (sur chatgpt.com) ou `grok_cookies` (sur grok.com). Seuls
+   `chatgpt_cookies` (sur chatgpt.com), `grok_cookies` (sur grok.com) ou
+   `muse_cookies` (sur muse.ai). Seuls
    les témoins du bon site sont retenus. Ils ne sont réinjectés que si tu
    changes l'option : le profil Chrome de l'add-on garde ensuite sa session.
 3. **Redémarre l'add-on** (les options ne sont lues qu'au démarrage).

@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.5"
+SERVICE_VERSION = "2.10.6"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -156,6 +156,9 @@ def _charger_config() -> dict:
         "grok_conversation": "https://grok.com/",
         "grok_message": "",
         "grok_cookies": "",
+        "muse_conversation": "https://muse.ai/",
+        "muse_message": "",
+        "muse_cookies": "",
         "navigateur_garder_min": 120,
         "redemarrage_ha": True,
     }
@@ -183,7 +186,8 @@ def _charger_config() -> dict:
                 cfg["render_timeout"] = int(opts["render_timeout"])
             for cle in ("chatgpt_conversation", "chatgpt_message",
                         "chatgpt_cookies", "grok_conversation",
-                        "grok_message", "grok_cookies"):
+                        "grok_message", "grok_cookies",
+                        "muse_conversation", "muse_message", "muse_cookies"):
                 if opts.get(cle):
                     cfg[cle] = str(opts[cle]).strip()
             if "redemarrage_ha" in opts:
@@ -615,6 +619,22 @@ SERVICES = {
         "saisie": 'form[data-composer="true"]',
         "connexion": 'a[href*="sign-in"]',
     },
+    # Muse (muse.ai, l'agent personnel de Meta) — ajouté le 2026-10-13 à la
+    # demande de Jonathan. ⚠️ Repères GÉNÉRIQUES : la page connectée n'a pas
+    # encore été vue (la page publique n'est qu'un formulaire de connexion).
+    # À caler au premier essai, comme l'ont été ChatGPT et Grok.
+    "muse": {
+        "hotes": ("muse.ai", "www.muse.ai"),
+        "domaines_cookies": ("muse.ai",),
+        "composeur": '[contenteditable="true"], textarea:not([aria-hidden])',
+        "envoyer": 'button[type="submit"]',
+        "arreter": 'button[aria-label*="Arrêter"], button[aria-label*="Stop"]',
+        "reponses": "",
+        "tour": "",
+        "tour_fini": "",
+        "saisie": "form",
+        "connexion": 'input[type="tel"], input[type="email"], input[name="email"]',
+    },
 }
 
 _VERROUS = {s: threading.Lock() for s in SERVICES}
@@ -826,6 +846,14 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                     return
 
                 cle = texte.strip()[:200]
+                if sv["tour"]:
+                    # Chrome à froid : la saisie arrive avant l'historique.
+                    # On laisse aux tours le temps de se poser avant de noter
+                    # « le dernier tour d'avant » (fil neuf = aucun, c'est permis).
+                    try:
+                        page.wait_for_selector(f'[{sv["tour"]}]', timeout=6_000)
+                    except PWTimeout:
+                        pass
                 avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
                 avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
                 avant_tour = _cle_tour(_dernier_tour(page, sv), sv)
@@ -843,11 +871,23 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 else:
                     page.keyboard.press("Enter")
 
-                # La phrase est partie quand elle apparaît UNE fois de plus dans
-                # la page (la zone de saisie, elle, s'est vidée).
-                limite_envoi = time.monotonic() + 15
+                # La phrase est partie quand un tour NEUF la porte. Sur un
+                # service à tours, la page n'affiche que les derniers : compter
+                # les occurrences y rendait « jamais apparue » pour une phrase
+                # bel et bien partie, d'où un renvoi en double (2026-10-13).
+                # Sans tours : elle apparaît UNE fois de plus dans la page.
+                limite_envoi = time.monotonic() + 30
                 while time.monotonic() < limite_envoi:
                     page.wait_for_timeout(1000)
+                    tour = _dernier_tour(page, sv)
+                    if tour is not None:
+                        try:
+                            if _cle_tour(tour, sv) != avant_tour and \
+                                    cle in tour.inner_text(timeout=3000):
+                                break
+                        except Exception:  # noqa: BLE001 - tour en cours de rendu
+                            pass
+                        continue
                     occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
                     if occ > avant_occ:
                         break
