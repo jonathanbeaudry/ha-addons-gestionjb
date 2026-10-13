@@ -78,7 +78,6 @@ message par défaut de ChatGPT (« fait prochaine sur le mcp carcajou »).
    changes l'option : le profil Chrome de l'add-on garde ensuite sa session.
 3. **Redémarre l'add-on** (les options ne sont lues qu'au démarrage).
 
-`navigateur_max_par_jour` (30) plafonne les phrases par service et par jour.
 `navigateur_garder_min` (120) borne le temps où la page reste ouverte pendant
 qu'un service travaille. Chaque phrase est notée dans
 `/data/navigateur_journal.jsonl`. Si une session expire, le VPS t'envoie un

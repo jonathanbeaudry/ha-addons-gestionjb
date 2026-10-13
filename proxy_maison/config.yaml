@@ -4,7 +4,7 @@
 # (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
 # remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
 name: Proxy maison (sortie résidentielle)
-version: "2.10.2"
+version: "2.10.3"
 slug: proxy_maison
 description: >-
   Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
@@ -55,7 +55,6 @@ options:
   chatgpt_cookies: ""
   grok_conversation: "https://grok.com/"
   grok_cookies: ""
-  navigateur_max_par_jour: 30
   navigateur_garder_min: 120
   # /ha_redemarrer (2.10.0) : coupe-circuit de la relance de HA à distance.
   redemarrage_ha: true
@@ -73,6 +72,5 @@ schema:
   grok_conversation: str?
   grok_message: str?
   grok_cookies: password?
-  navigateur_max_par_jour: int(1,200)
   navigateur_garder_min: int(1,600)
   redemarrage_ha: bool?

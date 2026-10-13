@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.2"
+SERVICE_VERSION = "2.10.3"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -156,7 +156,6 @@ def _charger_config() -> dict:
         "grok_conversation": "https://grok.com/",
         "grok_message": "",
         "grok_cookies": "",
-        "navigateur_max_par_jour": 30,
         "navigateur_garder_min": 120,
         "redemarrage_ha": True,
     }
@@ -189,9 +188,8 @@ def _charger_config() -> dict:
                     cfg[cle] = str(opts[cle]).strip()
             if "redemarrage_ha" in opts:
                 cfg["redemarrage_ha"] = bool(opts["redemarrage_ha"])
-            for cle in ("navigateur_max_par_jour", "navigateur_garder_min"):
-                if opts.get(cle) is not None:
-                    cfg[cle] = int(opts[cle])
+            if opts.get("navigateur_garder_min") is not None:
+                cfg["navigateur_garder_min"] = int(opts["navigateur_garder_min"])
         except (OSError, ValueError, json.JSONDecodeError) as e:
             print(f"[config] options.json illisible: {e}", file=sys.stderr)
 
@@ -563,8 +561,9 @@ def _render(url: str, referer: str = "", attendre: str = "",
 #
 # ⚠️ Conditions d'utilisation : OpenAI et xAI n'autorisent pas le pilotage de
 # leur site par un robot. Jonathan l'a su avant de trancher (2026-10-07) ; ce
-# sont ses comptes. Le plafond `navigateur_max_par_jour` existe pour que ça
-# reste un usage d'humain, jamais une boucle.
+# sont ses comptes. Le plafond de phrases par jour qui allait avec est retiré
+# (Jonathan, 2026-10-13 : « c'est inutile ») — la boucle des lots Carcajou en
+# envoie autant qu'il reste de lots.
 #
 # La connexion : un profil Chrome PERSISTANT par service sous /data, amorcé par
 # les témoins exportés de SON Chrome (extension Cookie-Editor → Export JSON) et
@@ -666,20 +665,6 @@ def cookies_pour_playwright(brut: str, domaines: tuple) -> list[dict]:
     return sortie
 
 
-def envois_du_jour(lignes: list, service: str, jour: str) -> int:
-    """Combien de phrases ce service a reçues ce jour-là (envois réussis)."""
-    n = 0
-    for brut in lignes:
-        try:
-            e = json.loads(brut)
-        except (ValueError, TypeError):
-            continue
-        if e.get("service") == service and e.get("ok") and \
-                str(e.get("quand", "")).startswith(jour):
-            n += 1
-    return n
-
-
 def reponse_apres(texte_page: str, envoye: str, rang: int, saisie: str = "") -> str:
     """Repli générique : ce qui suit la (rang+1)-ième occurrence de la phrase
     envoyée — NOTRE message, compté avant l'envoi — et précède la zone de
@@ -708,14 +693,6 @@ def _journaliser(entree: dict) -> None:
             f.write(json.dumps(entree, ensure_ascii=False) + "\n")
     except OSError as e:
         print(f"[navigateur] journal non écrit : {e}", file=sys.stderr)
-
-
-def _lire_journal() -> list:
-    try:
-        with open(NAV_JOURNAL, encoding="utf-8") as f:
-            return f.readlines()
-    except OSError:
-        return []
 
 
 def _etat_cookies(service: str) -> dict:
@@ -930,10 +907,6 @@ def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
         return 400, {"error": "texte vide (et aucun message par défaut en option)"}
     if len(texte) > TEXTE_MAX:
         return 413, {"error": f"texte trop long (> {TEXTE_MAX} caractères)"}
-    jour = datetime.date.today().isoformat()
-    deja = envois_du_jour(_lire_journal(), service, jour)
-    if deja >= CFG["navigateur_max_par_jour"]:
-        return 429, {"error": f"plafond du jour atteint ({deja} phrases à {service})"}
     if not _VERROUS[service].acquire(blocking=False):
         return 409, {"error": f"{service} travaille encore sur la phrase précédente "
                               "(voir /navigateur_lire)"}
