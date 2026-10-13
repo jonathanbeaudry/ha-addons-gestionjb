@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.7"
+SERVICE_VERSION = "2.10.8"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -987,8 +987,12 @@ def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
     # Sous les 100 s de Cloudflare. Pas fini à temps = on rend le partiel.
     termine.wait(timeout=88)
     corps = dict(res)
-    if not corps:
-        corps = {"ok": False, "etape": "attente", "error": "toujours en cours après 88 s"}
+    # Pas de verdict à temps (page lente à s'ouvrir) : la session continue
+    # derrière et peut encore envoyer. Le dire, au lieu de rendre un corps
+    # sans statut que l'appelant prenait pour un échec muet (2026-10-13).
+    if "ok" not in corps:
+        corps.update(ok=False, etape="attente",
+                     error="toujours en cours après 88 s")
     return 200, corps
 
 
