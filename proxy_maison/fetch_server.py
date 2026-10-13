@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.3"
+SERVICE_VERSION = "2.10.4"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -600,7 +600,10 @@ SERVICES = {
     "grok": {
         "hotes": ("grok.com", "www.grok.com"),
         "domaines_cookies": ("grok.com", "x.ai"),
-        "composeur": 'form[data-composer="true"] textarea',
+        # Octobre 2026 : la saisie est un bloc éditable ; le textarea qui
+        # reste dans le formulaire est un gabarit CACHÉ (aria-hidden).
+        "composeur": ('form[data-composer="true"] [contenteditable="true"], '
+                      'form[data-composer="true"] textarea:not([aria-hidden])'),
         "envoyer": 'form[data-composer="true"] button[type="submit"]',
         "arreter": ('form[data-composer="true"] button[aria-label*="Arrêter"], '
                     'form[data-composer="true"] button[aria-label*="Stop"]'),
@@ -825,7 +828,12 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
                 avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
                 avant_tour = _cle_tour(_dernier_tour(page, sv), sv)
-                page.click(sv["composeur"])
+                try:
+                    page.click(sv["composeur"], timeout=8_000)
+                except PWTimeout:
+                    # Un bandeau par-dessus (témoins, promo) bloque le clic,
+                    # pas le focus.
+                    page.locator(sv["composeur"]).first.focus()
                 page.keyboard.insert_text(texte)
                 page.wait_for_timeout(800)
                 bouton = page.locator(sv["envoyer"])
