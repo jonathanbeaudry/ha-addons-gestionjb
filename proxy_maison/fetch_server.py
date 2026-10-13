@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.1"
+SERVICE_VERSION = "2.10.2"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -581,11 +581,20 @@ SERVICES = {
     "chatgpt": {
         "hotes": ("chatgpt.com", "www.chatgpt.com"),
         "domaines_cookies": ("chatgpt.com", "openai.com"),
-        "composeur": "#prompt-textarea",
+        # Refonte d'octobre 2026 : plus d'id ni de data-testid sur la page.
+        # Les anciens repères restent en tête, les nouveaux suivent.
+        "composeur": '#prompt-textarea, div.ProseMirror[contenteditable="true"]',
         "envoyer": '[data-testid="send-button"], #composer-submit-button',
         "arreter": '[data-testid="stop-button"]',
         # La dernière réponse a un conteneur à elle ; sinon, repli générique.
-        "reponses": '[data-message-author-role="assistant"]',
+        "reponses": ('[data-message-author-role="assistant"], '
+                     '[data-markdown-text-style="assistant-message"]'),
+        # Un tour (question + réponse) porte cet attribut ; la page n'en garde
+        # que les derniers, donc on ne COMPTE plus les réponses : on lit celles
+        # du dernier tour, s'il est neuf. Son état de fin remplace le bouton
+        # « arrêter », qui n'a plus de repère.
+        "tour": "data-turn-key",
+        "tour_fini": '[data-talvt-turn-state="complete"]',
         "saisie": "",
         "connexion": '[data-testid="login-button"]',
     },
@@ -599,6 +608,8 @@ SERVICES = {
         "reponses": "",
         # Repli générique : la zone de saisie est retirée du texte lu, sinon
         # ses libellés (« Envoyer »…) finissent collés à la réponse.
+        "tour": "",
+        "tour_fini": "",
         "saisie": 'form[data-composer="true"]',
         "connexion": 'a[href*="sign-in"]',
     },
@@ -741,7 +752,38 @@ def _texte_de(page, selecteur: str) -> str:
         return ""
 
 
-def _lire_reponse(page, sv: dict, envoye: str, avant_n: int, avant_occ: int) -> str:
+def _dernier_tour(page, sv: dict):
+    """Le dernier tour de la conversation (ou None : service sans tours, ou
+    ancienne page)."""
+    if not sv["tour"]:
+        return None
+    tours = page.locator(f'[{sv["tour"]}]')
+    n = tours.count()
+    return tours.nth(n - 1) if n else None
+
+
+def _cle_tour(tour, sv: dict) -> str:
+    return (tour.get_attribute(sv["tour"]) or "") if tour is not None else ""
+
+
+def _occupe(page, sv: dict) -> bool:
+    if page.locator(sv["arreter"]).count() > 0:
+        return True
+    tour = _dernier_tour(page, sv)
+    return tour is not None and tour.locator(sv["tour_fini"]).count() == 0
+
+
+def _lire_reponse(page, sv: dict, envoye: str, avant_n: int, avant_occ: int,
+                  avant_tour: str = "") -> str:
+    tour = _dernier_tour(page, sv)
+    if tour is not None:
+        try:
+            if _cle_tour(tour, sv) == avant_tour:
+                return ""
+            return "\n".join(t.strip() for t in
+                             tour.locator(sv["reponses"]).all_inner_texts()).strip()
+        except Exception:  # noqa: BLE001
+            return ""
     if sv["reponses"]:
         loc = page.locator(sv["reponses"])
         n = loc.count()
@@ -805,6 +847,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 cle = texte.strip()[:200]
                 avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
                 avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
+                avant_tour = _cle_tour(_dernier_tour(page, sv), sv)
                 page.click(sv["composeur"])
                 page.keyboard.insert_text(texte)
                 page.wait_for_timeout(800)
@@ -843,8 +886,9 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 while time.monotonic() < limite:
                     page.wait_for_timeout(3000 if time.monotonic() - debut < 120
                                           else 15000)
-                    rep = _lire_reponse(page, sv, texte, avant_n, avant_occ)
-                    occupe = page.locator(sv["arreter"]).count() > 0
+                    rep = _lire_reponse(page, sv, texte, avant_n, avant_occ,
+                                        avant_tour)
+                    occupe = _occupe(page, sv)
                     res["reponse"] = rep[:20000]
                     _DERNIERE[service] = {"texte": texte[:500], "reponse": rep[:20000],
                                           "fini": False, "quand": quand}
