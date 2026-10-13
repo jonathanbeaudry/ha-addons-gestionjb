@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.10.6"
+SERVICE_VERSION = "2.10.7"
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -857,12 +857,24 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                 avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
                 avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
                 avant_tour = _cle_tour(_dernier_tour(page, sv), sv)
+                # Le service travaille DÉJÀ (réponse lancée avant un redémarrage
+                # de l'add-on, ou par Jonathan) : Entrée n'enverrait rien, la
+                # phrase resterait en brouillon et se collerait à la suivante
+                # (vu le 2026-10-13 : un message double). On ne tape pas.
+                if _occupe(page, sv):
+                    res.update(ok=False, etape="occupe", url=page.url,
+                               capture_jpeg=_capture(page),
+                               error=f"{service} travaille encore (vu sur la page)")
+                    return
                 try:
                     page.click(sv["composeur"], timeout=8_000)
                 except PWTimeout:
                     # Un bandeau par-dessus (témoins, promo) bloque le clic,
                     # pas le focus.
                     page.locator(sv["composeur"]).first.focus()
+                # Un brouillon resté d'un essai raté : on repart d'une zone vide.
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
                 page.keyboard.insert_text(texte)
                 page.wait_for_timeout(800)
                 bouton = page.locator(sv["envoyer"])
