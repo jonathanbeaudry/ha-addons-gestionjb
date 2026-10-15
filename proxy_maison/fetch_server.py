@@ -554,10 +554,15 @@ def _render(url: str, referer: str = "", attendre: str = "",
 #  2. puis, le même jour : « fais gérer Grok aussi et permets que ce soit toi
 #     [Ti-Coq] qui lances une phrase d'ici ».
 #
-# Ce que le VPS peut choisir : le SERVICE (liste fermée ci-dessous) et le
-# TEXTE. Ce qu'il ne choisit JAMAIS : la conversation (l'adresse de la ligne du
-# site dans l'option `sites`) ni le compte (ses témoins, même ligne). Le texte libre est un
-# geste explicite de Jonathan ; avant lui, seul le texte en option partait.
+# Ce que le VPS peut choisir : le SERVICE (liste fermée ci-dessous), le TEXTE,
+# et depuis 2.12.0 la CONVERSATION — mais seulement sur le site du service
+# (`adresse_conversation`). Ce qu'il ne choisit JAMAIS : le compte (les témoins
+# de la ligne du site dans l'option `sites`). Le texte libre est un geste
+# explicite de Jonathan ; avant lui, seul le texte en option partait.
+# 2.12.0 — Jonathan, 2026-10-15 : « fait que tu peux changer la convo, c'était
+# cave de la mettre hardcodée dans l'add-on » : la conversation de l'option
+# était restée bloquée sur une réponse jamais close (« en réflexion », bouton
+# arrêter allumé), et plus rien ne pouvait partir.
 #
 # ⚠️ Conditions d'utilisation : OpenAI et xAI n'autorisent pas le pilotage de
 # leur site par un robot. Jonathan l'a su avant de trancher (2026-10-07) ; ce
@@ -905,7 +910,34 @@ def _lire_reponse(page, sv: dict, envoye: str, avant_n: int, avant_occ: int,
                          envoye, avant_occ, saisie)
 
 
-def _session(service: str, texte: str, res: dict, termine: threading.Event) -> None:
+def adresse_conversation(service: str, conversation: str) -> tuple[str, str]:
+    """(adresse, erreur) de la conversation où taper. `conversation` :
+      ""          -> celle de la ligne du site dans l'option `sites` (comme avant) ;
+      "nouvelle"  -> une conversation neuve : l'adresse de la ligne sans son
+                     `/c/<id>` (un projet ChatGPT `/g/g-p-…` s'ouvre sur `/project`) ;
+      une adresse -> acceptée seulement en https et sur un hôte du service.
+    Le COMPTE ne change jamais : ce sont les témoins de la ligne du site."""
+    site = site_du_profil(service)
+    if not site:
+        return "", f"aucune ligne pour {service} dans l'option sites"
+    conversation = (conversation or "").strip()
+    if not conversation:
+        return site["url"], ""
+    if conversation == "nouvelle":
+        p = urllib.parse.urlparse(site["url"])
+        chemin = re.sub(r"/c/[^/]+/?$", "", p.path or "")
+        if re.fullmatch(r"/g/g-p-[^/]+", chemin):
+            chemin += "/project"
+        return f"https://{p.netloc}{chemin or '/'}", ""
+    p = urllib.parse.urlparse(conversation)
+    if p.scheme != "https" or (p.hostname or "").lower() not in SERVICES[service]["hotes"]:
+        return "", (f"conversation hors du site de {service} "
+                    f"(https://{'|'.join(SERVICES[service]['hotes'])}/… attendu)")
+    return conversation, ""
+
+
+def _session(service: str, texte: str, res: dict, termine: threading.Event,
+             url: str = "") -> None:
     """Tourne dans son propre fil (l'API sync de Playwright est liée au fil qui
     l'ouvre). Met `res` à jour au fil de l'eau ; `termine` = réponse finie ou
     échec. La page reste ouverte tant que le service travaille, au plus
@@ -934,7 +966,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
 
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 _stealth_lib(ctx, page)
-                page.goto(site["url"],
+                page.goto(url or site["url"],
                           wait_until="domcontentloaded", timeout=40_000)
                 try:
                     page.wait_for_selector(sv["composeur"], timeout=25_000)
@@ -1055,6 +1087,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
                         break
                     if stable >= 2:
                         res["fini"] = True
+                        res["url"] = page.url   # une conversation « nouvelle » a maintenant son /c/<id>
                         _DERNIERE[service]["fini"] = True
                         break
                 termine.set()
@@ -1077,7 +1110,7 @@ def _session(service: str, texte: str, res: dict, termine: threading.Event) -> N
         _verrou(service).release()
 
 
-def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
+def navigateur_dire(service: str, texte: str, conversation: str = "") -> tuple[int, dict]:
     """(code HTTP, corps). 4xx = demande refusée ; 200 = la tentative a eu
     lieu : `ok` dit si la phrase est partie, `fini` si la réponse est complète
     (sinon /navigateur_lire la donnera plus tard)."""
@@ -1086,6 +1119,9 @@ def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
     site = site_du_profil(service)
     if not site:
         return 412, {"error": f"aucune ligne pour {service} dans l'option sites"}
+    url, erreur = adresse_conversation(service, conversation)
+    if erreur:
+        return 400, {"error": erreur}
     texte = (texte or site["message"]).strip()
     if not texte:
         return 400, {"error": "texte vide (et aucun message par défaut sur sa ligne)"}
@@ -1096,7 +1132,7 @@ def navigateur_dire(service: str, texte: str) -> tuple[int, dict]:
                               "(voir /navigateur_lire)"}
     res: dict = {}
     termine = threading.Event()
-    threading.Thread(target=_session, args=(service, texte, res, termine),
+    threading.Thread(target=_session, args=(service, texte, res, termine, url),
                      daemon=True).start()
     # Sous les 100 s de Cloudflare. Pas fini à temps = on rend le partiel.
     termine.wait(timeout=88)
@@ -1367,8 +1403,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path in ("/navigateur_dire", "/navigateur_lire"):
-            # Pas d'URL ici : seul le jeton porteur s'applique. La conversation
-            # est une OPTION de l'add-on, jamais un paramètre (voir la section).
+            # Seul le jeton porteur s'applique. La conversation est un paramètre
+            # depuis 2.12.0, borné au site du service (adresse_conversation).
             if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
                 self._json(401, {"error": "jeton invalide"})
                 return
@@ -1379,7 +1415,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/navigateur_lire":
                 code, corps = navigateur_lire(service)
             else:
-                code, corps = navigateur_dire(service, (qs.get("texte") or [""])[0])
+                code, corps = navigateur_dire(service, (qs.get("texte") or [""])[0],
+                                              (qs.get("conversation") or [""])[0])
             self._json(code, corps)
             return
 

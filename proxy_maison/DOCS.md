@@ -86,12 +86,15 @@ connecté laisse une ligne dans `/data/navigateur_journal.jsonl`.
 
 ## ChatGPT, Grok et Muse : parler par la maison (`/navigateur_dire`)
 
-Le VPS envoie une phrase ; l'add-on la tape dans la conversation réglée ICI et
-rapporte la réponse. Le VPS choisit le service et le texte, jamais la
-conversation ni le compte. Ces trois services sont des lignes de `sites` comme
-les autres, avec deux particularités :
+Le VPS envoie une phrase ; l'add-on la tape et rapporte la réponse. Le VPS
+choisit le service, le texte et (depuis 2.12.0) la conversation — jamais le
+compte. Ces trois services sont des lignes de `sites` comme les autres, avec
+deux particularités :
 
-- `url` est la **conversation** où la phrase est tapée : l'adresse de ta
+- `url` est la conversation **par défaut** où la phrase est tapée. Le VPS peut
+  en demander une autre avec `conversation` : `nouvelle` (un fil neuf ; pour un
+  projet ChatGPT, la page du projet) ou une adresse du MÊME site — jamais un
+  autre site. La réponse rend l'adresse où continuer. L'adresse de ta
   conversation avec Carcajou (`https://chatgpt.com/c/...`), ou la racine
   (`https://grok.com/`, `https://muse.ai/`) pour un nouveau fil à chaque phrase.
   Pas de ligne = service fermé.
