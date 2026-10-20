@@ -4,7 +4,7 @@
 # (Historique : c'était un add-on LOCAL copié à la main dans /addons/. Le dépôt
 # remplace le copier-coller dans nano par un bouton « Mettre à jour ».)
 name: Proxy maison (sortie résidentielle)
-version: "2.12.0"
+version: "2.12.1"
 slug: proxy_maison
 description: >-
   Va chercher des pages web avec l'IP résidentielle de la maison pour le VPS
@@ -30,7 +30,13 @@ hassio_api: true
 # /health répond 200 sans jeton.
 watchdog: "http://[HOST]:[PORT:8099]/health"
 hassio_role: manager
-init: false
+# 2.12.1 (2026-10-20) : `init: true` = Docker met tini en PID 1. Avec `false` (depuis
+# le 2026-07-11, sans raison écrite), python était le PID 1 de `python:3.12-slim` et
+# ne récoltait JAMAIS les sous-processus orphelins de Chromium : chaque /render
+# laissait des zombies, et vers ~680 rendus par nuit (passe Alpha Spread) /render
+# tombait en 502 sur TOUT — /health, lui, restait à 200, donc le chien de garde ne
+# voyait rien. `processus`/`zombies` dans /health le rendent mesurable.
+init: true
 options:
   token: ""
   allowlist:

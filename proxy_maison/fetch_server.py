@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.11.0"
+SERVICE_VERSION = "2.12.1"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -233,6 +233,32 @@ def _ip_publique(host: str) -> tuple[bool, str]:
 # chaque image. Vidé à chaque appel de /render (voir _render) : il ne vit que le
 # temps d'une page, donc pas de DNS périmé qui traîne.
 _CACHE_HOTES: dict[str, bool] = {}
+
+
+def _compter_processus(proc: str = "/proc") -> dict:
+    """{"processus": n, "zombies": z, "pid1": "<nom>"} lus dans /proc — gratuit,
+    aucun Chromium lancé. Illisible = {} (la santé ne doit jamais tomber pour ça)."""
+    n = z = 0
+    pid1 = ""
+    try:
+        for d in os.listdir(proc):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"{proc}/{d}/stat", encoding="utf-8", errors="replace") as f:
+                    stat = f.read()
+            except OSError:
+                continue                    # le processus vient de finir
+            # « pid (nom) état … » — le nom peut contenir des espaces/parenthèses.
+            nom = stat[stat.find("(") + 1:stat.rfind(")")]
+            etat = stat[stat.rfind(")") + 2:stat.rfind(")") + 3]
+            n += 1
+            z += etat == "Z"
+            if d == "1":
+                pid1 = nom
+    except OSError:
+        return {}
+    return {"processus": n, "zombies": z, "pid1": pid1}
 
 
 def _hote_sur_pour_navigateur(host: str) -> bool:
@@ -1369,6 +1395,9 @@ class Handler(BaseHTTPRequestHandler):
                                        "/navigateur_lire"]
                                       if CFG["render_enabled"] else [])
                           + ["/ha_etat", "/ha_journal", "/ha_redemarrer"],
+                # Les processus du conteneur : des zombies qui montent = des
+                # Chromium mal récoltés (voir `init` dans config.yaml).
+                **_compter_processus(),
             })
             return
 
