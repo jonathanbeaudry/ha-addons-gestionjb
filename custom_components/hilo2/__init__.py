@@ -6,7 +6,6 @@ import asyncio
 from collections import OrderedDict
 from datetime import datetime, timedelta
 import traceback
-from typing import List, Optional
 
 from aiohttp import CookieJar, client_exceptions
 from homeassistant.components.select import (
@@ -84,6 +83,8 @@ PLATFORMS = COORDINATOR_AWARE_PLATFORMS + [
     Platform.LIGHT,
     Platform.SWITCH,
 ]
+
+type HiloConfigEntry = ConfigEntry[Hilo]
 
 # Suffixes used when building gateway-attached entity unique_ids in sensor.py
 # (e.g. f"{device.identifier.lower()}-{suffix}"). Used to migrate those
@@ -192,7 +193,7 @@ def _async_migrate_gateway_device_identifier(
     LOG.info("Migrated gateway device identifier %s -> %s", old_dsn, new_mac)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> bool:
     """Set up Hilo as config entry."""
     HiloFlowHandler.async_register_implementation(
         hass, AuthCodeWithPKCEImplementation(hass)
@@ -238,8 +239,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         LOG.debug("Timeout with API connection")
         raise ConfigEntryNotReady from err
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = hilo
+    entry.runtime_data = hilo
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -309,7 +309,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         LOG.debug("HILO_DEBUG: log_traces is %s", log_traces)
         hass.bus.async_listen("hilo2_debug", handle_debug_event)
 
-    async def async_reload_entry(_: HomeAssistant, updated_entry: ConfigEntry) -> None:
+    async def async_reload_entry(
+        _: HomeAssistant, updated_entry: HiloConfigEntry
+    ) -> None:
         """Handle an options update.
 
         This method will get called in two scenarios:
@@ -328,11 +330,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> bool:
     """Unload a Hilo config entry."""
     LOG.debug("Unloading Hilo Integration")
 
-    hilo = hass.data[DOMAIN][entry.entry_id]
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
+
+    hilo = entry.runtime_data
 
     hilo.should_signalr_reconnect = False
 
@@ -361,12 +366,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as err:
         LOG.error("Error disconnecting challenge SignalR hub: %s", err)
 
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        LOG.debug("Hilo Integration unloaded")
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    LOG.debug("Hilo Integration unloaded")
+    return True
 
 
 async def async_migrate_entry(hass, config_entry: ConfigEntry):
@@ -403,7 +404,7 @@ class Hilo:
         self._should_signalr_reconnect = True
         self._signalr_reconnect_tasks: list[asyncio.Task | None] = [None, None]
         self._update_task: list[asyncio.Task | None] = [None, None]
-        self.subscriptions: List[Optional[asyncio.Task]] = [None]
+        self.subscriptions: list[asyncio.Task | None] = [None]
         self.hq_plan_name = entry.options.get(CONF_HQ_PLAN_NAME, DEFAULT_HQ_PLAN_NAME)
         self.appreciation = entry.options.get(
             CONF_APPRECIATION_PHASE, DEFAULT_APPRECIATION_PHASE

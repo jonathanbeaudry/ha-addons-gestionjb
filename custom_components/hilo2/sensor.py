@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from os.path import isfile
 
 import aiofiles
@@ -13,7 +13,6 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_SCAN_INTERVAL,
     CURRENCY_DOLLAR,
@@ -54,7 +53,7 @@ from pyhilo.util import from_utc_timestamp
 import yaml
 from yaml.scanner import ScannerError
 
-from . import Hilo
+from . import Hilo, HiloConfigEntry
 from .const import (
     CONF_ENERGY_METER_PERIOD,
     CONF_GENERATE_ENERGY_METERS,
@@ -143,10 +142,12 @@ def generate_entities_from_device(device, hilo, scan_interval):
 
 # noinspection GrazieInspection
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: HiloConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Hilo sensors based on a config entry."""
-    hilo = hass.data[DOMAIN][entry.entry_id]
+    hilo = entry.runtime_data
     new_entities = []
     cost_entities = []
     hq_plan_name = entry.options.get(CONF_HQ_PLAN_NAME, DEFAULT_HQ_PLAN_NAME)
@@ -900,7 +901,7 @@ class HiloRewardSensor(HiloEntity, RestoreEntity, SensorEntity):
                         )
 
                     start_date_utc = datetime.fromisoformat(raw_event["startDateUtc"])
-                    event_age = datetime.now(timezone.utc) - start_date_utc
+                    event_age = datetime.now(UTC) - start_date_utc
                     if (
                         current_history_event
                         and current_history_event.get("state") == "off"
@@ -930,7 +931,7 @@ class HiloRewardSensor(HiloEntity, RestoreEntity, SensorEntity):
     async def _load_history(self) -> list:
         history: list = []
         if isfile(self._history_state_yaml):
-            async with aiofiles.open(self._history_state_yaml, mode="r") as yaml_file:
+            async with aiofiles.open(self._history_state_yaml) as yaml_file:
                 LOG.debug("Loading history state from yaml")
                 content = await yaml_file.read()
                 try:
@@ -1062,18 +1063,17 @@ class HiloChallengeSensor(HiloEntity, SensorEntity):
                     await asyncio.sleep(300)
                     del self._events[oldest_event_id]
                     break
-                else:
-                    current_event = self._events[event_id]
-                    LOG.debug(
-                        "handle_challenge_list_update current event is: %s",
-                        current_event,
-                    )
-                    updated_event = Event(**{**current_event.as_dict(), **challenge})
-                    if self._hilo.appreciation > 0:
-                        updated_event.appreciation(self._hilo.appreciation)
-                    if self._hilo.pre_cold > 0:
-                        updated_event.pre_cold(self._hilo.pre_cold)
-                    self._events[event_id] = updated_event
+                current_event = self._events[event_id]
+                LOG.debug(
+                    "handle_challenge_list_update current event is: %s",
+                    current_event,
+                )
+                updated_event = Event(**{**current_event.as_dict(), **challenge})
+                if self._hilo.appreciation > 0:
+                    updated_event.appreciation(self._hilo.appreciation)
+                if self._hilo.pre_cold > 0:
+                    updated_event.pre_cold(self._hilo.pre_cold)
+                self._events[event_id] = updated_event
         self._update_next_events()
 
     async def handle_challenge_details_update(self, challenge):
@@ -1154,7 +1154,7 @@ class HiloChallengeSensor(HiloEntity, SensorEntity):
     def state(self):
         """Return the current state based on next events."""
         if len(self._next_events) > 0:
-            event = Event(**{**{"id": 0}, **self._next_events[0]})
+            event = Event(**{"id": 0, **self._next_events[0]})
             return event.state
         return "off"
 
