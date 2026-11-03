@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from datetime import datetime, timedelta
-import traceback
+import contextlib
+from datetime import UTC, datetime, timedelta
 
 from aiohttp import CookieJar, client_exceptions
 from homeassistant.components.select import (
@@ -48,12 +48,12 @@ from pyhilo.signalr import SignalREvent, signalr_event_from_payload
 from pyhilo.util import from_utc_timestamp, time_diff
 from pysignalr.exceptions import ServerError as SignalRServerError
 
+from .api import HiloAuth
 from .config_flow import STEP_OPTION_SCHEMA, HiloFlowHandler
 from .const import (
     CONF_APPRECIATION_PHASE,
     CONF_CHALLENGE_LOCK,
     CONF_GENERATE_ENERGY_METERS,
-    CONF_HQ_PLAN_NAME,
     CONF_LOG_TRACES,
     CONF_PRE_COLD_PHASE,
     CONF_TARIFF,
@@ -212,16 +212,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> bool
             session=async_create_clientsession(
                 hass, cookie_jar=CookieJar(quote_cookie=False)
             ),
-            oauth_session=config_entry_oauth2_flow.OAuth2Session(
-                hass, entry, implementation
+            auth=HiloAuth(
+                config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
             ),
             log_traces=current_options.get(CONF_LOG_TRACES, DEFAULT_LOG_TRACES),
             state_yaml=hass.config.path("hilo2_state.yaml"),
         )
 
-    except (TimeoutError, client_exceptions.ClientConnectorError):
+    except (TimeoutError, client_exceptions.ClientConnectorError) as err:
         LOG.debug("Timeout")
-        raise ConfigEntryNotReady
+        raise ConfigEntryNotReady from err
 
     except Exception as err:
         raise ConfigEntryAuthFailed(err) from err
@@ -307,7 +307,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> bool
     log_traces = current_options.get(CONF_LOG_TRACES)
     if log_traces:
         LOG.debug("HILO_DEBUG: log_traces is %s", log_traces)
-        hass.bus.async_listen("hilo2_debug", handle_debug_event)
+        entry.async_on_unload(hass.bus.async_listen("hilo2_debug", handle_debug_event))
 
     async def async_reload_entry(
         _: HomeAssistant, updated_entry: HiloConfigEntry
@@ -344,30 +344,34 @@ async def async_unload_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> boo
     for task in list(hilo._signalr_reconnect_tasks):
         if not task.done():
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
     for task in list(hilo.subscriptions):
         if task and not task.done():
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
-    try:
-        await hilo._api.signalr_devices.disconnect()
-    except Exception as err:
-        LOG.error("Error disconnecting device SignalR hub: %s", err)
-    try:
-        await hilo._api.signalr_challenges.disconnect()
-    except Exception as err:
-        LOG.error("Error disconnecting challenge SignalR hub: %s", err)
+    await hilo._api.signalr_devices.disconnect()
+    await hilo._api.signalr_challenges.disconnect()
 
     LOG.debug("Hilo Integration unloaded")
     return True
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: HiloConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Allow removing a device only once Hilo no longer reports it."""
+    hilo = entry.runtime_data
+    current = {device.identifier for device in hilo.devices.all}
+    if hilo.unknown_tracker_device:
+        current.add(hilo.unknown_tracker_device.identifier)
+    return not any(
+        domain == DOMAIN and identifier in current
+        for domain, identifier in device_entry.identifiers
+    )
 
 
 async def async_migrate_entry(hass, config_entry: ConfigEntry):
@@ -405,7 +409,7 @@ class Hilo:
         self._signalr_reconnect_tasks: list[asyncio.Task | None] = [None, None]
         self._update_task: list[asyncio.Task | None] = [None, None]
         self.subscriptions: list[asyncio.Task | None] = [None]
-        self.hq_plan_name = entry.options.get(CONF_HQ_PLAN_NAME, DEFAULT_HQ_PLAN_NAME)
+        self.hq_plan_name = DEFAULT_HQ_PLAN_NAME
         self.appreciation = entry.options.get(
             CONF_APPRECIATION_PHASE, DEFAULT_APPRECIATION_PHASE
         )
@@ -505,9 +509,8 @@ class Hilo:
                     else:
                         LOG.warning(f"SHOULD NOT HAPPEN: Not SignalREvent: {msg_data}")
                         await handler(msg_data)
-                except Exception as e:
-                    LOG.error("Error in SignalR handler %s: %s", handler_name, e)
-                    LOG.error(traceback.format_exc())
+                except Exception:  # noqa: BLE001
+                    LOG.exception("Error in SignalR handler %s", handler_name)
 
     async def _handle_challenge_events(self, event: SignalREvent) -> None:
         """Handle all challenge-related SignalR events."""
@@ -799,15 +802,11 @@ class Hilo:
     async def _fetch_legacy_gateway_dsn(self, new_mac: str) -> str | None:
         """This function looks up the Hilo gateway device in the device registry and
         returns its old DSN-based identifier if it exists. If it doesn't,
-        it returns Noneto use the MAC address instead."""
+        it returns None to use the MAC address instead."""
         device_registry = dr.async_get(self._hass)
-        devices = device_registry.devices
-        device_iter = (
-            devices
-            if Version(current_version) >= Version("2026.9")
-            else devices.values()
-        )
-        for device in device_iter:
+        for device in dr.async_entries_for_config_entry(
+            device_registry, self.entry.entry_id
+        ):
             if device.manufacturer != "Hilo" or device.model != "EQ000017":
                 continue
             for domain, identifier in device.identifiers:
@@ -825,6 +824,18 @@ class Hilo:
             new_unique_id = f"{new_mac.lower()}-{suffix}"
             self.async_migrate_unique_id(old_unique_id, new_unique_id, Platform.SENSOR)
 
+    async def _async_update_plan_name(self) -> None:
+        """Set the plan name from the rate plan reported by Hilo."""
+        try:
+            rate_plan = await self._api.get_rate_plan(self.devices.location_id)
+        except (HiloError, KeyError) as err:
+            LOG.warning(
+                "Unable to fetch rate plan, using %s: %s", self.hq_plan_name, err
+            )
+            return
+        self.hq_plan_name = "flex d" if rate_plan.lower() == "flex" else "rate d"
+        LOG.debug("Rate plan %s mapped to %s", rate_plan, self.hq_plan_name)
+
     async def async_init(self, scan_interval: int) -> None:
         """Initialize the Hilo "manager" class.
 
@@ -838,6 +849,7 @@ class Hilo:
         """
         # Step 1: Get location IDs (still REST)
         await self.devices.async_init()
+        await self._async_update_plan_name()
 
         # Step 2: Register SignalR callbacks and start connections
         self._api.signalr_devices.add_connect_callback(self._on_devices_connected)
@@ -931,7 +943,7 @@ class Hilo:
                     backoff,
                     err,
                 )
-            except Exception as err:  # pylint: disable=broad-except
+            except Exception as err:  # noqa: BLE001
                 LOG.warning(
                     "SignalRHub[%s]: connection error; reconnecting in %ss — %s",
                     id,
@@ -1001,23 +1013,24 @@ class Hilo:
         sorted_entity_registry_dict = OrderedDict(sorted(entity_registry_dict.items()))
         LOG.debug("Entities Ordered dict is %s", sorted_entity_registry_dict)
 
-        # Initialize empty list to put meter name into
-        filtered_names = []
-
         # ic-dev21: Let's grab the meter from our dict
-        for entity_id, entity_data in sorted_entity_registry_dict.items():
+        filtered_names = [
+            entity_data["name"]
+            for entity_data in sorted_entity_registry_dict.values()
             if all(
                 substring in entity_data["name"] for substring in ["meter", "_power"]
-            ):
-                filtered_names.append(entity_data["name"])
+            )
+        ]
 
         LOG.debug("Hilo Smart meter name is: %s", filtered_names)
 
         # Format output to use in check_tarif
         return ", ".join(filtered_names) if filtered_names else ""
 
-    def set_state(self, entity, state, new_attrs={}, keep_state=False, force=False):
+    def set_state(self, entity, state, new_attrs=None, keep_state=False, force=False):
         """Set the state of an entity."""
+        if new_attrs is None:
+            new_attrs = {}
         params = f"{entity=} {state=} {new_attrs=} {keep_state=}"
         current = self._hass.states.get(entity)
         if not current:
@@ -1173,10 +1186,8 @@ class Hilo:
                 unknown_source_tracker,
                 smart_meter,
             ]:
-                try:
+                with contextlib.suppress(ValueError):
                     known_power += int(float(state.state))
-                except ValueError:
-                    pass
             if not entity.endswith("_hilo2_energy") or entity.endswith("_cost"):
                 continue
             self.fix_utility_sensor(entity, state)
@@ -1198,7 +1209,7 @@ class Hilo:
                     {
                         "deviceId": 69420,
                         "locationId": self.devices.location_id,
-                        "timeStampUTC": datetime.utcnow().isoformat(),
+                        "timeStampUTC": datetime.now(UTC).isoformat(),
                         "attribute": "Power",
                         "value": unknown_power,
                         "valueType": "Watt",
@@ -1237,7 +1248,7 @@ class Hilo:
             ATTR_UNIT_OF_MEASUREMENT: parent_unit,  # note ic-dev21: now uses parent_unit directly
             ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
         }
-        if not all(a in attrs.keys() for a in new_attrs):
+        if not all(a in attrs for a in new_attrs):
             LOG.warning(
                 f"Fixing utility sensor: {entity} {current_state} new_attrs: {new_attrs}"
             )
