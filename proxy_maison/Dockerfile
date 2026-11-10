@@ -28,6 +28,13 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
 # 2.13.0 (BO-1295) : + patchright — Playwright modifié pour ne plus laisser ses traces, utilisé SEULEMENT pour
 # les hôtes de HOTES_INDETECTABLES (StoryGraph). Il pilote le Google Chrome déjà installé ci-dessous
 # (channel="chrome") : aucun navigateur de plus à télécharger. Tout le reste garde Playwright.
+# 2.13.0 : libatomic1 AVANT Playwright. Le build du 2026-11-10 est mort sur « playwright/driver/node : error while
+# loading shared libraries: libatomic.so.1 » : la version courante (non épinglée) de Playwright embarque un node qui
+# exige cette lib, et `--with-deps` ne passe qu'APRÈS le premier appel au driver. Sans elle, même la 2.12.1 ne se
+# reconstruirait plus.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir playwright playwright-stealth patchright \
  && playwright install --with-deps chromium \
  && ( playwright install --with-deps chrome \

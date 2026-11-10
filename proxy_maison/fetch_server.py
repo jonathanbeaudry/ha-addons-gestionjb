@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.13.0"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
+SERVICE_VERSION = "2.13.1"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -570,8 +570,24 @@ def _render_moteur(url: str, referer: str = "", attendre: str = "",
             if entetes:
                 page.set_extra_http_headers(entetes)
 
+            # BO-1295 : avec patchright, la 1re page est souvent le défi Cloudflare (403) que Chrome RÉSOUT seul en
+            # quelques secondes, puis recharge la vraie page. Le statut rendu est celui du DERNIER document du cadre
+            # principal, pas celui du défi (essai du 10-11 : 403 « The StoryGraph », 20 livres, après 15 s).
+            documents: list[int] = []
+            if indetectable:
+                page.on("response", lambda r: documents.append(r.status)
+                        if r.request.resource_type == "document" and r.frame == page.main_frame else None)
+
             rep = page.goto(url, wait_until="domcontentloaded", timeout=ms)
             statut = rep.status if rep else 0
+            if indetectable:
+                try:
+                    page.wait_for_function(
+                        "() => !/just a moment|un instant|checking your browser/i.test(document.title)",
+                        timeout=min(ms, 30000))
+                    page.wait_for_load_state("domcontentloaded", timeout=min(ms, 15000))
+                except PWTimeout:
+                    pass
 
             # « Fini de charger » n'existe pas vraiment sur une page moderne :
             # on laisse le choix au VPS plutôt que de deviner.
@@ -610,6 +626,8 @@ def _render_moteur(url: str, referer: str = "", attendre: str = "",
                 except PWTimeout:
                     pass
 
+            if indetectable and documents:
+                statut = documents[-1]
             return {"ok": True, "status": statut, "url": page.url,
                     "html": page.content()[:CFG["max_bytes"]],
                     "captures": captees, "attente_ratee": attente_ratee,
