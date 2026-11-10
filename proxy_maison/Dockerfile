@@ -25,7 +25,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
 # xvfb : écran virtuel pour lancer Chrome GRAPHIQUE (headless=False) sans écran
 #        physique — un navigateur headless se fait flaguer « robot ».
 # (+~350 Mo pour Chrome + xvfb ; la machine maison a 364 Go de libre.)
-RUN pip install --no-cache-dir playwright playwright-stealth \
+# 2.13.0 (BO-1295) : + patchright — Playwright modifié pour ne plus laisser ses traces, utilisé SEULEMENT pour
+# les hôtes de HOTES_INDETECTABLES (StoryGraph). Il pilote le Google Chrome déjà installé ci-dessous
+# (channel="chrome") : aucun navigateur de plus à télécharger. Tout le reste garde Playwright.
+RUN pip install --no-cache-dir playwright playwright-stealth patchright \
  && playwright install --with-deps chromium \
  && ( playwright install --with-deps chrome \
       || echo "[build] Google Chrome indisponible — /render retombera en Chromium headless" ) \

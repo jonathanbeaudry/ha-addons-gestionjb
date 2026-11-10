@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.12.1"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
+SERVICE_VERSION = "2.13.0"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -432,9 +432,53 @@ def _garder_anti_ssrf(ctx, bloquees: list) -> None:
 # /render — la page avec son JavaScript exécuté (Chromium)
 # --------------------------------------------------------------------------- #
 
+# 🕵️ 2.13.0 (BO-1295, Jonathan 2026-11-10 : « storygraph était super utile, j'aimerais qu'on trouve une solution »,
+# puis « ah ça j'aime ça ») — LES HÔTES QUI DÉTECTENT PLAYWRIGHT. Depuis le 29-10, StoryGraph (Cloudflare) rend
+# « Just a moment… / Un instant… » au vrai Chrome graphique de la maison, même avec un profil persistant et 46 s
+# d'attente : ce n'est pas l'IP (pas « you have been blocked »), c'est le PILOTAGE qui est reconnu. Pour CES hôtes
+# seulement, le rendu passe par patchright (Playwright modifié pour ne plus laisser ses traces), avec le vrai Chrome,
+# SANS aucun camouflage ajouté (les scripts injectés et playwright-stealth sont eux-mêmes des traces), dans un profil
+# PERSISTANT (le témoin de Cloudflare survit d'un appel à l'autre), un rendu à la fois par profil.
+# TOUT LE RESTE (ChatGPT, Grok, Muse, Waze, Morningstar, Les Libraires) garde exactement le chemin d'avant.
+HOTES_INDETECTABLES = frozenset({"app.thestorygraph.com"})
+
+
+def _indetectable(url: str, site: dict | None) -> bool:
+    """Ce rendu passe-t-il par patchright ? Seulement un hôte de la liste, hors site connecté, avec un écran."""
+    hote = (urllib.parse.urlparse(url).hostname or "").lower()
+    return hote in HOTES_INDETECTABLES and site is None and bool(os.environ.get("DISPLAY"))
+
+
+def _ouvrir_indetectable(pw, profil: str):
+    """Le vrai Chrome graphique piloté par patchright, profil persistant, sans rien de plaqué."""
+    c = pw.chromium.launch_persistent_context(
+        os.path.join("/data/profils_patchright", profil),
+        channel="chrome", headless=False, no_viewport=True)
+    return c, c, "chrome-patchright"
+
+
 def _render(url: str, referer: str = "", attendre: str = "",
             selecteur: str = "", capture: str = "", clic: str = "",
             clic_n: int = 1, profil: str = "", site: dict | None = None) -> dict:
+    """Aiguille : un hôte de HOTES_INDETECTABLES passe par patchright (un rendu à la fois par profil) ; tout le reste
+    par le moteur d'avant, inchangé."""
+    if not _indetectable(url, site):
+        return _render_moteur(url, referer, attendre, selecteur, capture, clic, clic_n, profil, site)
+    nom = profil or re.sub(r"[^a-z0-9]+", "-", (urllib.parse.urlparse(url).hostname or "site").lower())[:32]
+    verrou = _verrou("patchright-" + nom)
+    if not verrou.acquire(timeout=CFG["render_timeout"]):
+        raise RuntimeError(f"profil patchright {nom} occupé depuis {CFG['render_timeout']} s")
+    try:
+        return _render_moteur(url, referer, attendre, selecteur, capture, clic, clic_n, nom, site,
+                              indetectable=True)
+    finally:
+        verrou.release()
+
+
+def _render_moteur(url: str, referer: str = "", attendre: str = "",
+                   selecteur: str = "", capture: str = "", clic: str = "",
+                   clic_n: int = 1, profil: str = "", site: dict | None = None,
+                   indetectable: bool = False) -> dict:
     """Ouvre `url` dans Chromium, laisse tourner le JS, rend le DOM final.
 
     Un navigateur NEUF par appel : plus lent (~1-3 s de démarrage) qu'un
@@ -464,8 +508,13 @@ def _render(url: str, referer: str = "", attendre: str = "",
     """
     # Import PARESSEUX : /fetch ne doit jamais dépendre de Chromium (voir le
     # docstring en tête). Un add-on sans navigateur sert encore /fetch.
-    from playwright.sync_api import TimeoutError as PWTimeout
-    from playwright.sync_api import sync_playwright
+    if indetectable:
+        # BO-1295 : MÊME API que Playwright, sans ses traces (voir HOTES_INDETECTABLES).
+        from patchright.sync_api import TimeoutError as PWTimeout
+        from patchright.sync_api import sync_playwright
+    else:
+        from playwright.sync_api import TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
 
     ms = CFG["render_timeout"] * 1000
     captees: list[dict] = []
@@ -473,21 +522,27 @@ def _render(url: str, referer: str = "", attendre: str = "",
     _CACHE_HOTES.clear()
 
     with sync_playwright() as pw:
-        nav, ctx, mode_nav = _ouvrir_navigateur(
-            pw, site["profil"] if site else profil)
+        if indetectable:
+            nav, ctx, mode_nav = _ouvrir_indetectable(pw, profil)
+        else:
+            nav, ctx, mode_nav = _ouvrir_navigateur(
+                pw, site["profil"] if site else profil)
         try:
-            # Socle stealth : injecté AVANT toute navigation, sur chaque page.
-            try:
-                ctx.add_init_script(_STEALTH_JS)
-            except Exception:  # noqa: BLE001
-                pass
+            # Socle stealth : injecté AVANT toute navigation, sur chaque page. PAS pour patchright : un script
+            # injecté est justement une trace que ces sites lisent.
+            if not indetectable:
+                try:
+                    ctx.add_init_script(_STEALTH_JS)
+                except Exception:  # noqa: BLE001
+                    pass
 
             _garder_anti_ssrf(ctx, bloquees)
             temoins_poses = _poser_temoins(ctx, site) if site else False
             page = ctx.new_page()
             # playwright-stealth EN PLUS du socle maison (best-effort, jamais
-            # fatal) — la 3ᵉ couche de « fait les 3 ».
-            _stealth_lib(ctx, page)
+            # fatal) — la 3ᵉ couche de « fait les 3 ». Pas pour patchright (même raison).
+            if not indetectable:
+                _stealth_lib(ctx, page)
 
             if capture:
                 def _sur_reponse(rep) -> None:
