@@ -6,6 +6,7 @@ import asyncio
 from collections import OrderedDict
 import contextlib
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from aiohttp import CookieJar, client_exceptions
 from homeassistant.components.select import (
@@ -35,8 +36,7 @@ from homeassistant.helpers import (
 )
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util import dt as dt_util
+from homeassistant.util import dt as dt_util, slugify
 from packaging.version import Version
 from pyhilo import API
 from pyhilo.device import HiloDevice
@@ -73,7 +73,11 @@ from .const import (
     LOG,
     MIN_SCAN_INTERVAL,
 )
+from .coordinator import HiloCoordinator
 from .oauth2 import AuthCodeWithPKCEImplementation
+
+if TYPE_CHECKING:
+    from .sensor import HiloChallengeSensor
 
 DISPATCHER_TOPIC_SIGNALR_EVENT = "pyhilo2_signalr_event"
 SIGNAL_UPDATE_ENTITY = "pyhilo2_device_update_{}"
@@ -241,27 +245,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> bool
 
     entry.runtime_data = hilo
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Note (ic-dev21): This is a bit of a hack to rename some entities that were created with non-standard names in early versions
-    # HA has changed the way they name entities linked to a device by default and this breaks the naming scheme of the gateway entities.
-    # If we let the HA default behaviour, all gateway entities (such as challenge sensor) will be prefixed with "hilo_gateway_",
-    # This code will check for the old entity IDs and rename them to the new format if they exist.
-
     entity_registry = er.async_get(hass)
-    gateway_entity_renames = {
-        "sensor.hilo_gateway_defi_hilo": "sensor.defi_hilo",
-        "sensor.hilo_gateway_notifications_hilo": "sensor.notifications_hilo",
-        "sensor.hilo_gateway_recompenses_hilo": "sensor.recompenses_hilo",
-        "sensor.hilo_gateway_outdoor_weather_hilo": "sensor.outdoor_weather_hilo",
-        "sensor.hilo_gateway_hilo_rate_current": "sensor.hilo_rate_current",
-        "sensor.hilo_gateway_hilo_rate_low": "sensor.hilo_rate_low",
-        "sensor.hilo_gateway_hilo_rate_medium": "sensor.hilo_rate_medium",
-        "sensor.hilo_gateway_hilo_rate_access": "sensor.hilo_rate_access",
-        "sensor.hilo_gateway_hilo_rate_low_threshold": "sensor.hilo_rate_low_threshold",
-        "sensor.hilo_gateway_hilo_rate_reward_rate": "sensor.hilo_rate_reward_rate",
-        "sensor.hilo_gateway_hilo_cost_total": "sensor.hilo_cost_total",
-        "sensor.hilo_gateway": "sensor.hilo_gateway",
+    # Migrate pre-existing device-prefixed meter energy entity IDs before platform
+    # setup so UtilityManager and check_tarif find sensor.hilo_energy_total immediately.
+    energy_entity_renames = {
+        f"sensor.meter00_{HILO_ENERGY_TOTAL}": f"sensor.{HILO_ENERGY_TOTAL}",
+        **{
+            f"sensor.{slugify(d.name)}_{HILO_ENERGY_TOTAL}": f"sensor.{HILO_ENERGY_TOTAL}"
+            for d in hilo.devices.all
+            if d.type == "Meter"
+        },
     }
     for old_id, new_id in {}.items():  # hilo2 : jamais (registre partagé avec Hilo 1)
         if old_id == new_id or not entity_registry.async_get(old_id):
@@ -277,9 +270,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: HiloConfigEntry) -> bool
         entity_registry.async_update_entity(old_id, new_entity_id=new_id)
         LOG.info("Migrated entity ID %s -> %s", old_id, new_id)
 
-    # Note (ic-dev21): this new renaming by HA also breaks sensor.hilo_energy_total, which is used in check_tarif
-    energy_entity_renames = {
-        "sensor.meter00_hilo_energy_total": "sensor.hilo_energy_total"
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Note (ic-dev21): This is a bit of a hack to rename some entities that were created with non-standard names in early versions
+    # HA has changed the way they name entities linked to a device by default and this breaks the naming scheme of the gateway entities.
+    # If we let the HA default behaviour, all gateway entities (such as challenge sensor) will be prefixed with "hilo_gateway_",
+    # This code will check for the old entity IDs and rename them to the new format if they exist.
+
+    gateway_entity_renames = {
+        "sensor.hilo_gateway_defi_hilo": "sensor.defi_hilo",
+        "sensor.hilo_gateway_notifications_hilo": "sensor.notifications_hilo",
+        "sensor.hilo_gateway_recompenses_hilo": "sensor.recompenses_hilo",
+        "sensor.hilo_gateway_outdoor_weather_hilo": "sensor.outdoor_weather_hilo",
+        "sensor.hilo_gateway_hilo_rate_current": "sensor.hilo_rate_current",
+        "sensor.hilo_gateway_hilo_rate_low": "sensor.hilo_rate_low",
+        "sensor.hilo_gateway_hilo_rate_medium": "sensor.hilo_rate_medium",
+        "sensor.hilo_gateway_hilo_rate_access": "sensor.hilo_rate_access",
+        "sensor.hilo_gateway_hilo_rate_low_threshold": "sensor.hilo_rate_low_threshold",
+        "sensor.hilo_gateway_hilo_rate_reward_rate": "sensor.hilo_rate_reward_rate",
+        "sensor.hilo_gateway_hilo_cost_total": "sensor.hilo_cost_total",
+        "sensor.hilo_gateway": "sensor.hilo_gateway",
     }
     for old_id, new_id in {}.items():  # hilo2 : jamais (registre partagé avec Hilo 1)
         if old_id == new_id or not entity_registry.async_get(old_id):
@@ -427,8 +437,10 @@ class Hilo:
             CONF_GENERATE_ENERGY_METERS, DEFAULT_GENERATE_ENERGY_METERS
         )
         self.cost_sensors: dict = {}
+        # This gets filled in by the sensor platform:
+        self.challenge_sensor: HiloChallengeSensor | None = None
         # This will get filled in by async_init:
-        self.coordinator: DataUpdateCoordinator | None = None
+        self.coordinator: HiloCoordinator | None = None
         self.unknown_tracker_device: HiloDevice | None = None
         self._events: dict = {}
         if self.track_unknown_sources:
@@ -571,7 +583,7 @@ class Hilo:
             # runs (scan_interval) to have updated data in the dashboard.
             for device in updated_devices:
                 async_dispatcher_send(
-                    self._hass, SIGNAL_UPDATE_ENTITY.format(device.id)
+                    self._hass, SIGNAL_UPDATE_ENTITY.format(device.hilo_id)
                 )
 
         elif event.target == "DeviceListInitialValuesReceived":
@@ -605,7 +617,7 @@ class Hilo:
             updated_devices = self.devices.parse_values_received(event.arguments[0])
             for device in updated_devices:
                 async_dispatcher_send(
-                    self._hass, SIGNAL_UPDATE_ENTITY.format(device.id)
+                    self._hass, SIGNAL_UPDATE_ENTITY.format(device.hilo_id)
                 )
 
     @callback
@@ -910,12 +922,8 @@ class Hilo:
                 EVENT_HOMEASSISTANT_STOP, signalr_disconnect_listener
             )
         )
-        self.coordinator = DataUpdateCoordinator(
-            self._hass,
-            LOG,
-            name="hilo2",
-            update_interval=timedelta(seconds=scan_interval),
-            update_method=self.async_update,
+        self.coordinator = HiloCoordinator(
+            self._hass, self.entry, self, timedelta(seconds=scan_interval)
         )
 
     async def start_signalr_loop(self, hub, id) -> None:
@@ -1053,18 +1061,16 @@ class Hilo:
         self._hass.states.async_set(entity, state, attrs, force_update=force)
 
     @property
-    def high_times(self):
+    def high_times(self) -> bool:
         """Check if the current time is within high tariff periods."""
-        challenge_sensor = self._hass.states.get("sensor.defi_hilo")
-
-        if challenge_sensor is None:
+        if self.challenge_sensor is None:
             LOG.warning("high_times check tarif challenge sensor not found")
             return False
 
         LOG.debug(
-            "high_times check tarif challenge sensor is %s", challenge_sensor.state
+            "high_times check tarif challenge sensor is %s", self.challenge_sensor.state
         )
-        return challenge_sensor.state == "reduction"
+        return self.challenge_sensor.state == "reduction"
 
     def check_season(self, current_time: datetime | None = None) -> bool:
         """Determine if we are using a winter or summer rate."""
