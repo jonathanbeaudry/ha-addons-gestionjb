@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SERVICE_VERSION = "2.13.1"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
+SERVICE_VERSION = "2.14.0"   # = `version` de config.yaml (tests/test_addon_maison_init.py l'exige)
 
 # UA « navigateur » pour /fetch (urllib, sites type Reddit/Morningstar) : qu'ils
 # servent une page normale, pas un blocage API. NON utilisé par /render depuis la
@@ -366,7 +366,7 @@ ARGS_NAV = ["--no-sandbox", "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled"]
 
 
-def _ouvrir_navigateur(pw, profil: str = ""):
+def _ouvrir_navigateur(pw, profil: str = "", args_en_plus: list | tuple = ()):
     """(nav, ctx, mode). Voie 1 = vrai Chrome + écran (xvfb) : l'identité
     d'un visiteur normal pour que reCAPTCHA Enterprise NOTE « humain » et
     laisse passer georss (note en tête + mémoire waze-usage-perso). Voie 2
@@ -379,7 +379,8 @@ def _ouvrir_navigateur(pw, profil: str = ""):
                     "viewport": {"width": 1366, "height": 900}}
             # Pas de user_agent forcé : un vrai Chrome présente SON UA et ses
             # client-hints cohérents — moins « menteur » qu'un UA plaqué.
-            base = dict(headless=False, channel="chrome", args=ARGS_NAV,
+            base = dict(headless=False, channel="chrome",
+                        args=ARGS_NAV + list(args_en_plus),
                         ignore_default_args=["--enable-automation"])
             if profil:
                 # Profils Chrome à part : un dossier écrit par Chromium puis
@@ -401,7 +402,7 @@ def _ouvrir_navigateur(pw, profil: str = ""):
         # /data = stockage persistant de l'add-on (survit aux mises à jour).
         c = pw.chromium.launch_persistent_context(
             os.path.join("/data/profils", profil),
-            headless=True, args=ARGS_NAV, **opts)
+            headless=True, args=ARGS_NAV + list(args_en_plus), **opts)
         return c, c, "chromium-headless"
     n = pw.chromium.launch(headless=True, args=ARGS_NAV)
     return n, n.new_context(**opts), "chromium-headless"
@@ -673,7 +674,12 @@ def _render_moteur(url: str, referer: str = "", attendre: str = "",
 
 NAV_DIR = "/data"
 NAV_JOURNAL = os.path.join(NAV_DIR, "navigateur_journal.jsonl")
-TEXTE_MAX = 4000
+# 2.14.0 (Jonathan, 2026-11-25) : un lot de 5 à 10 œuvres compactées doit passer
+# d'un coup. Bornes de SÉCURITÉ, pas des réglages : au-delà, refus (413) ou
+# réponse coupée — et dans les deux cas, la réponse le DIT. Avant : 4 000 / 20 000,
+# et la coupe de la réponse était muette.
+TEXTE_MAX = 100_000
+REPONSE_MAX = 200_000
 
 # Les sélecteurs de chaque site — en un seul endroit : le jour où un site
 # change, c'est ici qu'on regarde, et l'échec le dit (capture d'écran rendue).
@@ -748,7 +754,7 @@ def _verrou(profil: str) -> threading.Lock:
     with _VERROUS_GARDE:
         return _VERROUS.setdefault(profil, threading.Lock())
 IMMOBILE_MAX_S = 15 * 60       # sans un caractère de plus : on rend la main
-_DERNIERE: dict = {}          # service -> dernier état connu de l'échange
+_DERNIERE: dict = {}          # service, ou (service, conversation) -> dernier échange
 
 
 # --------------------------------------------------------------------------- #
@@ -1035,184 +1041,347 @@ def adresse_conversation(service: str, conversation: str) -> tuple[str, str]:
     return conversation, ""
 
 
-def _session(service: str, texte: str, res: dict, termine: threading.Event,
-             url: str = "") -> None:
-    """Tourne dans son propre fil (l'API sync de Playwright est liée au fil qui
-    l'ouvre). Met `res` à jour au fil de l'eau ; `termine` = réponse finie ou
-    échec. La page reste ouverte tant que le service travaille, au plus
-    `navigateur_garder_min` minutes : fermer en plein travail ne doit pas
-    pouvoir couper une boucle d'outils de ChatGPT."""
-    sv = SERVICES[service]
-    site = site_du_profil(service)
-    quand = datetime.datetime.now().isoformat(timespec="seconds")
+# --------------------------------------------------------------------------- #
+# 2.14.0 — PLUSIEURS CONVERSATIONS DU MÊME SERVICE EN MÊME TEMPS
+# --------------------------------------------------------------------------- #
+#
+# Jonathan, 2026-11-25 : faire travailler le ChatGPT de Mary sur le PMB de
+# Boussole en DEUX lots de 10 dans DEUX conversations séparées, en parallèle.
+# Avant, un verrou par SERVICE : la 2ᵉ phrase prenait un 409 tant que la 1ʳᵉ
+# n'était pas finie, quelle que soit la conversation.
+#
+# Le profil Chrome d'un service est PERSISTANT (sa session, ses témoins) : Chrome
+# refuse de l'ouvrir deux fois. Donc UN Chrome par service, tenu par UN fil
+# « propriétaire » (l'API sync de Playwright est liée au fil qui l'ouvre), et UNE
+# PAGE (onglet) par conversation. Chaque conversation est un générateur : il
+# avance jusqu'à sa prochaine attente (`yield <secondes>`) et le propriétaire
+# passe à la suivante — c'est lui seul qui touche au navigateur.
+#
+# Les verrous :
+#   · PAR CONVERSATION : deux phrases dans la même conversation = 409, comme avant
+#     (la 2ᵉ se taperait en brouillon dans la 1ʳᵉ — piège payé le 2026-10-13) ;
+#   · « nouvelle » = une conversation neuve à chaque appel, jamais en conflit ;
+#     quand ChatGPT lui donne son adresse (/c/<id>), cette adresse est verrouillée
+#     aussi (`_ALIAS`) ;
+#   · au plus CONVERSATIONS_MAX onglets en même temps, tous services confondus ;
+#   · pas de nouvel onglet si la machine a moins de MEMOIRE_MIN_MO de libre, et
+#     chaque onglet a un tas JavaScript plafonné (ARGS_CONVERSATIONS) : la maison
+#     de Mary a 4 Go en tout, et Home Assistant tourne sur la même.
+# Le verrou de PROFIL (`_verrou(service)`) reste : le propriétaire le tient tant
+# que Chrome est ouvert, donc un /render sur le site prend encore son 409.
+
+CONVERSATIONS_MAX = 3
+MEMOIRE_MIN_MO = 700
+ARGS_CONVERSATIONS = ["--js-flags=--max-old-space-size=1024"]
+DERNIERES_GARDEES = 50        # conversations finies que /navigateur_lire retrouve
+
+_NAV_GARDE = threading.Lock()
+_CONVS: dict = {}             # (service, cle) -> travail, conversations EN COURS
+_ALIAS: dict = {}             # (service, adresse) -> cle (une « nouvelle » a reçu son adresse)
+_FILES: dict = {}             # service -> travaux qui attendent leur onglet
+_PROPRIOS: dict = {}          # service -> fil propriétaire vivant
+
+
+def _norm_adresse(adresse: str) -> str:
+    """Une adresse de conversation, sans requête ni fragment ni « / » final :
+    https://chatgpt.com/c/abc?x=1 et https://chatgpt.com/c/abc/ sont la même."""
+    p = urllib.parse.urlparse(adresse)
+    return f"https://{(p.hostname or '').lower()}{(p.path or '').rstrip('/') or '/'}"
+
+
+def _memoire_dispo_mo() -> int | None:
+    """MemAvailable de la machine (en Mo) ; None si illisible."""
     try:
-        from playwright.sync_api import TimeoutError as PWTimeout
-        from playwright.sync_api import sync_playwright
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for ligne in f:
+                if ligne.startswith("MemAvailable:"):
+                    return int(ligne.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
-        with sync_playwright() as pw:
-            nav, ctx, mode_nav = _ouvrir_navigateur(pw, service)
-            res["navigateur"] = mode_nav
+
+def _noter_derniere(service: str, cle: str, d: dict) -> None:
+    """Le dernier échange : celui du service (lu sans `conversation`, comme
+    avant 2.14.0) ET celui de la conversation."""
+    with _NAV_GARDE:
+        _DERNIERE[service] = d
+        _DERNIERE[(service, cle)] = d
+        par_conv = [k for k in _DERNIERE if isinstance(k, tuple)]
+        for vieux in par_conv[:-DERNIERES_GARDEES]:
+            _DERNIERE.pop(vieux, None)
+
+
+def borner_reponse(lue: str) -> dict:
+    """La réponse se lit EN ENTIER jusqu'à REPONSE_MAX ; au-delà, coupée ET dit
+    — jamais une coupe silencieuse (avant 2.14.0 : 20 000, sans un mot)."""
+    if len(lue) <= REPONSE_MAX:
+        return {"reponse": lue}
+    return {"reponse": lue[:REPONSE_MAX], "reponse_coupee": True,
+            "avertissement": f"réponse coupée à {REPONSE_MAX} caractères sur "
+                             f"{len(lue)} (borne REPONSE_MAX de l'add-on)"}
+
+
+def _attendre_selecteur(page, selecteur: str, secondes: float):
+    """Générateur : attend `selecteur` sans bloquer les autres conversations.
+    Rend (par StopIteration) vrai s'il est apparu."""
+    limite = time.monotonic() + secondes
+    while True:
+        try:
+            if page.locator(selecteur).count() > 0:
+                return True
+        except Exception:  # noqa: BLE001 - page en cours de navigation
+            pass
+        if time.monotonic() >= limite:
+            return False
+        yield 0.5
+
+
+def _echange(page, service: str, t: dict, bloquees: list):
+    """Une phrase dans UNE conversation, sur SON onglet. Générateur : chaque
+    `yield` rend la main au propriétaire pour le nombre de secondes donné. Met
+    `t["res"]` à jour au fil de l'eau. La page reste ouverte tant que le service
+    travaille, au plus `navigateur_garder_min` minutes : fermer en plein travail
+    ne doit pas pouvoir couper une boucle d'outils de ChatGPT."""
+    sv = SERVICES[service]
+    res, texte, cle, quand = t["res"], t["texte"], t["cle"], t["quand"]
+    page.goto(t["url"], wait_until="domcontentloaded", timeout=40_000)
+    if not (yield from _attendre_selecteur(page, sv["composeur"], 25)):
+        deconnecte = page.locator(sv["connexion"]).count() > 0
+        res.update(ok=False, etape="composeur", url=page.url,
+                   capture_jpeg=_capture(page),
+                   error=(f"pas connecté à {service} : recoller les "
+                          "témoins dans sa ligne de l'option sites")
+                   if deconnecte else
+                   "zone de saisie introuvable (le site a changé ?)")
+        return
+
+    if sv["pret"]:
+        if not (yield from _attendre_selecteur(page, sv["pret"], 150)):
+            res.update(ok=False, etape="pas_pret", url=page.url,
+                       capture_jpeg=_capture(page),
+                       error=f"{service} n'était toujours pas prêt après 150 s")
+            return
+        yield 1.5
+    cle_texte = texte.strip()[:200]
+    if sv["tour"]:
+        # Chrome à froid : la saisie arrive avant l'historique. On laisse aux
+        # tours le temps de se poser avant de noter « le dernier tour d'avant »
+        # (fil neuf = aucun, c'est permis).
+        yield from _attendre_selecteur(page, f'[{sv["tour"]}]', 6)
+    avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle_texte)
+    avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
+    avant_tour = _cle_tour(_dernier_tour(page, sv), sv)
+    # Le service travaille DÉJÀ dans cette conversation (réponse lancée avant un
+    # redémarrage de l'add-on, ou par Jonathan) : Entrée n'enverrait rien, la
+    # phrase resterait en brouillon et se collerait à la suivante (vu le
+    # 2026-10-13 : un message double). On ne tape pas.
+    if _occupe(page, sv):
+        res.update(ok=False, etape="occupe", url=page.url,
+                   capture_jpeg=_capture(page),
+                   error=f"{service} travaille encore (vu sur la page)")
+        return
+    try:
+        page.click(sv["composeur"], timeout=8_000)
+    except Exception:  # noqa: BLE001 - un bandeau par-dessus bloque le clic, pas le focus
+        page.locator(sv["composeur"]).first.focus()
+    # Un brouillon resté d'un essai raté : on repart d'une zone vide.
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Delete")
+    page.keyboard.insert_text(texte)
+    yield 0.8
+    bouton = page.locator(sv["envoyer"])
+    if bouton.count() and bouton.first.is_enabled():
+        bouton.first.click()
+    else:
+        page.keyboard.press("Enter")
+
+    # La phrase est partie quand un tour NEUF la porte. Sur un service à tours,
+    # la page n'affiche que les derniers : compter les occurrences y rendait
+    # « jamais apparue » pour une phrase bel et bien partie (2026-10-13). Sans
+    # tours : elle apparaît UNE fois de plus dans la page.
+    limite_envoi = time.monotonic() + 30
+    while True:
+        if time.monotonic() >= limite_envoi:
+            res.update(ok=False, etape="envoi", url=page.url,
+                       capture_jpeg=_capture(page),
+                       error="phrase tapée mais jamais apparue dans la conversation")
+            return
+        yield 1
+        tour = _dernier_tour(page, sv)
+        if tour is not None:
             try:
+                if _cle_tour(tour, sv) != avant_tour and \
+                        cle_texte in tour.inner_text(timeout=3000):
+                    break
+            except Exception:  # noqa: BLE001 - tour en cours de rendu
+                pass
+            continue
+        occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle_texte)
+        if occ > avant_occ:
+            break
+
+    res.update(ok=True, etape="envoye", fini=False, reponse="",
+               url=page.url, hotes_bloques=bloquees)
+    _journaliser({"quand": quand, "service": service, "ok": True,
+                  "conversation": cle, "texte": texte[:500]})
+
+    # Fini = bouton « arrêter » absent ET réponse non vide et inchangée deux
+    # relevés de suite (entre deux appels d'outils, le bouton disparaît un
+    # instant ; la réponse, elle, bouge).
+    limite = time.monotonic() + CFG["navigateur_garder_min"] * 60
+    debut = time.monotonic()
+    precedent, stable = None, 0
+    bouge = time.monotonic()
+    d = {"texte": texte[:500], "reponse": "", "fini": False, "quand": quand,
+         "conversation": cle, "url": page.url}
+    while time.monotonic() < limite:
+        yield 3 if time.monotonic() - debut < 120 else 15
+        lue = _lire_reponse(page, sv, texte, avant_n, avant_occ, avant_tour)
+        occupe = _occupe(page, sv)
+        borne = borner_reponse(lue)
+        rep = borne["reponse"]
+        res.pop("reponse_coupee", None)
+        res.pop("avertissement", None)
+        res.update(borne)
+        if page.url != d["url"] and page.url.startswith("https://"):
+            # Une conversation « nouvelle » a maintenant son /c/<id> : cette
+            # adresse est verrouillée et lisible elle aussi.
+            res["url"] = d["url"] = page.url
+            with _NAV_GARDE:
+                _ALIAS[(service, _norm_adresse(page.url))] = cle
+        d = {"texte": d["texte"], "fini": False, "quand": quand,
+             "conversation": cle, "url": d["url"], **borne}
+        _noter_derniere(service, cle, d)
+        stable = stable + 1 if (rep and rep == precedent and not occupe) else 0
+        if rep != precedent:
+            bouge = time.monotonic()
+        precedent = rep
+        # Une réponse qui ne bouge plus (ou qu'on lit vide) alors que le site se
+        # dit occupé : vu le 2026-10-13, la page restait ouverte pour rien.
+        if time.monotonic() - bouge > IMMOBILE_MAX_S:
+            break
+        if stable >= 2:
+            res["fini"] = True
+            res["url"] = page.url
+            _noter_derniere(service, cle, {**d, "fini": True, "url": page.url})
+            break
+    print(f"[navigateur] {service} {cle} : onglet fermé ("
+          + ("réponse finie" if res.get("fini")
+             else "plus de mouvement ou limite atteinte") + ")", file=sys.stderr)
+
+
+def _finir(service: str, t: dict, erreur: Exception | None = None) -> None:
+    """Une conversation se termine (bien ou mal) : on libère SA place."""
+    res = t["res"]
+    if erreur is not None and "ok" not in res:
+        res.update(ok=False, etape="exception",
+                   error=f"{type(erreur).__name__}: {erreur}")
+        print(f"[navigateur] {service} : {type(erreur).__name__}: {erreur}",
+              file=sys.stderr)
+    if not res.get("ok"):
+        _journaliser({"quand": t["quand"], "service": service, "ok": False,
+                      "conversation": t["cle"], "texte": t["texte"][:500],
+                      "erreur": res.get("error", "")})
+    with _NAV_GARDE:
+        _CONVS.pop((service, t["cle"]), None)
+    t["termine"].set()
+
+
+def _fermer_page(page) -> None:
+    try:
+        page.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _proprietaire(service: str) -> None:
+    """LE fil qui tient le Chrome du service : il ouvre un onglet par
+    conversation demandée, les fait avancer à tour de rôle, et ferme Chrome
+    quand la dernière est finie."""
+    actifs: list = []
+    verrou = _verrou(service)
+    try:
+        # Un /render sur le site (ou le Chrome d'avant, en train de se fermer)
+        # tient le profil : on l'attend, borné.
+        if not verrou.acquire(timeout=CFG["render_timeout"] + 30):
+            raise RuntimeError(f"le profil {service} est tenu par un rendu (/render)")
+        try:
+            from playwright.sync_api import sync_playwright
+            site = site_du_profil(service)
+            with sync_playwright() as pw:
+                nav, ctx, mode_nav = _ouvrir_navigateur(pw, service, ARGS_CONVERSATIONS)
                 try:
-                    ctx.add_init_script(_STEALTH_JS)
-                except Exception:  # noqa: BLE001
-                    pass
-                bloquees: list = []
-                _garder_anti_ssrf(ctx, bloquees)
-
-                if _poser_temoins(ctx, site):
-                    res["cookies_reinjectes"] = True
-
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                _stealth_lib(ctx, page)
-                page.goto(url or site["url"],
-                          wait_until="domcontentloaded", timeout=40_000)
-                try:
-                    page.wait_for_selector(sv["composeur"], timeout=25_000)
-                except PWTimeout:
-                    deconnecte = page.locator(sv["connexion"]).count() > 0
-                    res.update(ok=False, etape="composeur", url=page.url,
-                               capture_jpeg=_capture(page),
-                               error=(f"pas connecté à {service} : recoller les "
-                                      "témoins dans sa ligne de l'option sites")
-                               if deconnecte else
-                               "zone de saisie introuvable (le site a changé ?)")
-                    return
-
-                if sv["pret"]:
                     try:
-                        page.wait_for_selector(sv["pret"], timeout=150_000)
-                    except PWTimeout:
-                        res.update(ok=False, etape="pas_pret", url=page.url,
-                                   capture_jpeg=_capture(page),
-                                   error=f"{service} n'était toujours pas prêt "
-                                         "après 150 s")
-                        return
-                    page.wait_for_timeout(1500)
-                cle = texte.strip()[:200]
-                if sv["tour"]:
-                    # Chrome à froid : la saisie arrive avant l'historique.
-                    # On laisse aux tours le temps de se poser avant de noter
-                    # « le dernier tour d'avant » (fil neuf = aucun, c'est permis).
-                    try:
-                        page.wait_for_selector(f'[{sv["tour"]}]', timeout=6_000)
-                    except PWTimeout:
+                        ctx.add_init_script(_STEALTH_JS)
+                    except Exception:  # noqa: BLE001
                         pass
-                avant_occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
-                avant_n = page.locator(sv["reponses"]).count() if sv["reponses"] else 0
-                avant_tour = _cle_tour(_dernier_tour(page, sv), sv)
-                # Le service travaille DÉJÀ (réponse lancée avant un redémarrage
-                # de l'add-on, ou par Jonathan) : Entrée n'enverrait rien, la
-                # phrase resterait en brouillon et se collerait à la suivante
-                # (vu le 2026-10-13 : un message double). On ne tape pas.
-                if _occupe(page, sv):
-                    res.update(ok=False, etape="occupe", url=page.url,
-                               capture_jpeg=_capture(page),
-                               error=f"{service} travaille encore (vu sur la page)")
-                    return
-                try:
-                    page.click(sv["composeur"], timeout=8_000)
-                except PWTimeout:
-                    # Un bandeau par-dessus (témoins, promo) bloque le clic,
-                    # pas le focus.
-                    page.locator(sv["composeur"]).first.focus()
-                # Un brouillon resté d'un essai raté : on repart d'une zone vide.
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Delete")
-                page.keyboard.insert_text(texte)
-                page.wait_for_timeout(800)
-                bouton = page.locator(sv["envoyer"])
-                if bouton.count() and bouton.first.is_enabled():
-                    bouton.first.click()
-                else:
-                    page.keyboard.press("Enter")
-
-                # La phrase est partie quand un tour NEUF la porte. Sur un
-                # service à tours, la page n'affiche que les derniers : compter
-                # les occurrences y rendait « jamais apparue » pour une phrase
-                # bel et bien partie, d'où un renvoi en double (2026-10-13).
-                # Sans tours : elle apparaît UNE fois de plus dans la page.
-                limite_envoi = time.monotonic() + 30
-                while time.monotonic() < limite_envoi:
-                    page.wait_for_timeout(1000)
-                    tour = _dernier_tour(page, sv)
-                    if tour is not None:
-                        try:
-                            if _cle_tour(tour, sv) != avant_tour and \
-                                    cle in tour.inner_text(timeout=3000):
+                    bloquees: list = []
+                    _garder_anti_ssrf(ctx, bloquees)
+                    temoins = _poser_temoins(ctx, site)
+                    # L'onglet de départ ne porte aucune conversation : c'est lui
+                    # qui fait tourner Playwright (routes anti-SSRF comprises)
+                    # pendant les attentes.
+                    pompe = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    _stealth_lib(ctx, pompe)
+                    while True:
+                        with _NAV_GARDE:
+                            nouveaux = _FILES.pop(service, [])
+                            if not nouveaux and not actifs:
+                                _PROPRIOS.pop(service, None)
                                 break
-                        except Exception:  # noqa: BLE001 - tour en cours de rendu
-                            pass
-                        continue
-                    occ = (_texte_de(page, "main") or _texte_de(page, "body")).count(cle)
-                    if occ > avant_occ:
-                        break
-                else:
-                    res.update(ok=False, etape="envoi", url=page.url,
-                               capture_jpeg=_capture(page),
-                               error="phrase tapée mais jamais apparue dans "
-                                     "la conversation")
-                    return
+                        for t in nouveaux:
+                            t["res"]["navigateur"] = mode_nav
+                            t["res"]["onglets"] = len(actifs) + 1
+                            if temoins:
+                                t["res"]["cookies_reinjectes"] = True
+                                temoins = False
+                            try:
+                                page = ctx.new_page()
+                            except Exception as e:  # noqa: BLE001
+                                _finir(service, t, e)
+                                continue
+                            actifs.append({"t": t, "page": page, "reveil": 0.0,
+                                           "gen": _echange(page, service, t, bloquees)})
+                        for a in list(actifs):
+                            if a["reveil"] > time.monotonic():
+                                continue
+                            try:
+                                a["reveil"] = time.monotonic() + next(a["gen"])
+                            except StopIteration:
+                                actifs.remove(a)
+                                _fermer_page(a["page"])
+                                _finir(service, a["t"])
+                            except Exception as e:  # noqa: BLE001 - dit au VPS, jamais muet
+                                actifs.remove(a)
+                                _fermer_page(a["page"])
+                                _finir(service, a["t"], e)
+                        if actifs:
+                            attente = min(a["reveil"] for a in actifs) - time.monotonic()
+                            pompe.wait_for_timeout(max(50, min(attente, 1.0) * 1000))
+                finally:
+                    nav.close()
+        finally:
+            verrou.release()
+    except Exception as e:  # noqa: BLE001 - Chrome n'a pas pu s'ouvrir, ou est tombé
+        with _NAV_GARDE:
+            restants = _FILES.pop(service, [])
+            _PROPRIOS.pop(service, None)
+        for t in restants + [a["t"] for a in actifs]:
+            _finir(service, t, e)
 
-                res.update(ok=True, etape="envoye", fini=False, reponse="",
-                           url=page.url, hotes_bloques=bloquees)
-                _journaliser({"quand": quand, "service": service, "ok": True,
-                              "texte": texte[:500]})
 
-                # Fini = bouton « arrêter » absent ET réponse non vide et
-                # inchangée deux relevés de suite (entre deux appels d'outils,
-                # le bouton disparaît un instant ; la réponse, elle, bouge).
-                limite = time.monotonic() + CFG["navigateur_garder_min"] * 60
-                debut = time.monotonic()
-                precedent, stable = None, 0
-                bouge = time.monotonic()
-                while time.monotonic() < limite:
-                    page.wait_for_timeout(3000 if time.monotonic() - debut < 120
-                                          else 15000)
-                    rep = _lire_reponse(page, sv, texte, avant_n, avant_occ,
-                                        avant_tour)
-                    occupe = _occupe(page, sv)
-                    res["reponse"] = rep[:20000]
-                    _DERNIERE[service] = {"texte": texte[:500], "reponse": rep[:20000],
-                                          "fini": False, "quand": quand}
-                    stable = stable + 1 if (rep and rep == precedent and not occupe) else 0
-                    if rep != precedent:
-                        bouge = time.monotonic()
-                    precedent = rep
-                    # Une réponse qui ne bouge plus (ou qu'on lit vide) alors
-                    # que le site se dit occupé : vu le 2026-10-13, la page
-                    # restait ouverte pour rien et bloquait la phrase suivante.
-                    if time.monotonic() - bouge > IMMOBILE_MAX_S:
-                        break
-                    if stable >= 2:
-                        res["fini"] = True
-                        res["url"] = page.url   # une conversation « nouvelle » a maintenant son /c/<id>
-                        _DERNIERE[service]["fini"] = True
-                        break
-                termine.set()
-                print(f"[navigateur] {service} : page fermée ("
-                      + ("réponse finie" if res.get("fini")
-                         else "plus de mouvement ou limite atteinte")
-                      + ")", file=sys.stderr)
-            finally:
-                nav.close()
-    except Exception as e:  # noqa: BLE001 - l'erreur remonte au VPS, jamais muette
-        if "ok" not in res:
-            res.update(ok=False, etape="exception",
-                       error=f"{type(e).__name__}: {e}")
-        print(f"[navigateur] {service} : {type(e).__name__}: {e}", file=sys.stderr)
-    finally:
-        if not res.get("ok"):
-            _journaliser({"quand": quand, "service": service, "ok": False,
-                          "texte": texte[:500], "erreur": res.get("error", "")})
-        termine.set()
-        _verrou(service).release()
+def _lancer_proprietaire(service: str) -> threading.Thread:
+    fil = threading.Thread(target=_proprietaire, args=(service,), daemon=True)
+    fil.start()
+    return fil
 
 
 def navigateur_dire(service: str, texte: str, conversation: str = "") -> tuple[int, dict]:
     """(code HTTP, corps). 4xx = demande refusée ; 200 = la tentative a eu
     lieu : `ok` dit si la phrase est partie, `fini` si la réponse est complète
-    (sinon /navigateur_lire la donnera plus tard)."""
+    (sinon /navigateur_lire la donnera plus tard). `conversation` du corps =
+    la poignée à rendre à /navigateur_lire."""
     if service not in SERVICES:
         return 400, {"error": f"service inconnu (permis : {', '.join(SERVICES)})"}
     site = site_du_profil(service)
@@ -1225,16 +1394,35 @@ def navigateur_dire(service: str, texte: str, conversation: str = "") -> tuple[i
     if not texte:
         return 400, {"error": "texte vide (et aucun message par défaut sur sa ligne)"}
     if len(texte) > TEXTE_MAX:
-        return 413, {"error": f"texte trop long (> {TEXTE_MAX} caractères)"}
-    if not _verrou(service).acquire(blocking=False):
-        return 409, {"error": f"{service} travaille encore sur la phrase précédente "
-                              "(voir /navigateur_lire)"}
-    res: dict = {}
-    termine = threading.Event()
-    threading.Thread(target=_session, args=(service, texte, res, termine, url),
-                     daemon=True).start()
+        return 413, {"error": f"texte trop long : {len(texte)} caractères, la borne "
+                              f"de l'add-on est {TEXTE_MAX}"}
+    cle = ("nouvelle-" + os.urandom(4).hex()
+           if (conversation or "").strip() == "nouvelle" else _norm_adresse(url))
+    res: dict = {"conversation": cle}
+    t = {"service": service, "texte": texte, "url": url, "res": res,
+         "termine": threading.Event(),
+         "quand": datetime.datetime.now().isoformat(timespec="seconds")}
+    with _NAV_GARDE:
+        cle = _ALIAS.get((service, cle), cle)
+        t["cle"] = res["conversation"] = cle
+        if (service, cle) in _CONVS:
+            return 409, {"error": f"{service} travaille encore dans cette conversation "
+                                  "(voir /navigateur_lire?conversation=…)",
+                         "conversation": cle}
+        if len(_CONVS) >= CONVERSATIONS_MAX:
+            return 409, {"error": f"{service} travaille encore : {len(_CONVS)} "
+                                  f"conversations ouvertes, la borne est "
+                                  f"{CONVERSATIONS_MAX} — réessayer quand une finit"}
+        libre = _memoire_dispo_mo()
+        if libre is not None and libre < MEMOIRE_MIN_MO:
+            return 503, {"error": f"mémoire basse : {libre} Mo libres, il en faut "
+                                  f"{MEMOIRE_MIN_MO} pour ouvrir une conversation"}
+        _CONVS[(service, cle)] = t
+        _FILES.setdefault(service, []).append(t)
+        if service not in _PROPRIOS:
+            _PROPRIOS[service] = _lancer_proprietaire(service)
     # Sous les 100 s de Cloudflare. Pas fini à temps = on rend le partiel.
-    termine.wait(timeout=88)
+    t["termine"].wait(timeout=88)
     corps = dict(res)
     # Pas de verdict à temps (page lente à s'ouvrir) : la session continue
     # derrière et peut encore envoyer. Le dire, au lieu de rendre un corps
@@ -1245,15 +1433,36 @@ def navigateur_dire(service: str, texte: str, conversation: str = "") -> tuple[i
     return 200, corps
 
 
-def navigateur_lire(service: str) -> tuple[int, dict]:
-    """Le dernier échange connu de ce service depuis le démarrage de l'add-on."""
+def navigateur_lire(service: str, conversation: str = "") -> tuple[int, dict]:
+    """Le dernier échange connu depuis le démarrage de l'add-on. Sans
+    `conversation` : celui du SERVICE, et `en_cours` = le Chrome du service est
+    ouvert (le sens d'avant 2.14.0, dont la boucle des lots dépend). Avec : la
+    conversation donnée (poignée rendue par /navigateur_dire, ou son adresse)."""
     if service not in SERVICES:
         return 400, {"error": f"service inconnu (permis : {', '.join(SERVICES)})"}
-    d = _DERNIERE.get(service)
+    conversation = (conversation or "").strip()
+    with _NAV_GARDE:
+        ouvertes = sorted(c for (s, c) in _CONVS if s == service)
+        if not conversation:
+            d = _DERNIERE.get(service)
+            if not d:
+                return 404, {"error": "aucun échange en mémoire depuis le démarrage"}
+            return 200, {"ok": True, "service": service,
+                         "en_cours": _verrou(service).locked(),
+                         "conversations_en_cours": ouvertes, **d}
+        cle = conversation
+        if (service, cle) not in _DERNIERE and (service, cle) not in _CONVS:
+            norm = _norm_adresse(conversation)
+            cle = _ALIAS.get((service, norm), norm)
+        d = _DERNIERE.get((service, cle))
+        en_cours = (service, cle) in _CONVS
     if not d:
-        return 404, {"error": "aucun échange en mémoire depuis le démarrage"}
-    return 200, {"ok": True, "service": service,
-                 "en_cours": _verrou(service).locked(), **d}
+        if en_cours:
+            return 200, {"ok": True, "service": service, "conversation": cle,
+                         "en_cours": True, "fini": False, "reponse": ""}
+        return 404, {"error": "conversation inconnue depuis le démarrage de l'add-on"}
+    return 200, {"ok": True, "service": service, "en_cours": en_cours,
+                 "conversations_en_cours": ouvertes, **d}
 
 
 # --------------------------------------------------------------------------- #
@@ -1471,6 +1680,13 @@ class Handler(BaseHTTPRequestHandler):
                 # Les processus du conteneur : des zombies qui montent = des
                 # Chromium mal récoltés (voir `init` dans config.yaml).
                 **_compter_processus(),
+                # 2.14.0 : les bornes du navigateur, pour que le VPS les lise
+                # au lieu de les recopier.
+                "navigateur": {"texte_max": TEXTE_MAX, "reponse_max": REPONSE_MAX,
+                               "conversations_max": CONVERSATIONS_MAX,
+                               "conversations_en_cours": len(_CONVS),
+                               "memoire_min_mo": MEMOIRE_MIN_MO,
+                               "memoire_dispo_mo": _memoire_dispo_mo()},
             })
             return
 
@@ -1505,21 +1721,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path in ("/navigateur_dire", "/navigateur_lire"):
-            # Seul le jeton porteur s'applique. La conversation est un paramètre
-            # depuis 2.12.0, borné au site du service (adresse_conversation).
-            if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
-                self._json(401, {"error": "jeton invalide"})
-                return
-            if not CFG["render_enabled"]:
-                self._json(503, {"error": "navigateur désactivé (option render_enabled)"})
-                return
-            service = (qs.get("service") or [""])[0]
-            if parsed.path == "/navigateur_lire":
-                code, corps = navigateur_lire(service)
-            else:
-                code, corps = navigateur_dire(service, (qs.get("texte") or [""])[0],
-                                              (qs.get("conversation") or [""])[0])
-            self._json(code, corps)
+            self._route_navigateur(parsed.path, qs)
             return
 
         if parsed.path != "/fetch":
@@ -1563,6 +1765,48 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Truncated", tronque)
         self.end_headers()
         self.wfile.write(body)
+
+    # 2.14.0 : un texte long ne tient pas dans une URL (Cloudflare la borne à
+    # ~16 Ko, et un caractère accentué en coûte 6 une fois encodé). Le POST
+    # porte les mêmes paramètres dans un corps x-www-form-urlencoded ; seul
+    # /navigateur_dire l'accepte.
+    CORPS_MAX = 2 * 1024 * 1024
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/navigateur_dire":
+            self._json(405, {"error": "POST seulement pour /navigateur_dire"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > self.CORPS_MAX:
+            self._json(413, {"error": f"corps absent ou trop gros (max {self.CORPS_MAX} octets)"})
+            return
+        qs = urllib.parse.parse_qs(parsed.query)
+        corps = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"),
+                                      keep_blank_values=True)
+        qs.update(corps)
+        self._route_navigateur(parsed.path, qs)
+
+    def _route_navigateur(self, chemin: str, qs: dict) -> None:
+        # Seul le jeton porteur s'applique. La conversation est un paramètre
+        # depuis 2.12.0, borné au site du service (adresse_conversation).
+        if not CFG["token"] or self.headers.get("X-Proxy-Token") != CFG["token"]:
+            self._json(401, {"error": "jeton invalide"})
+            return
+        if not CFG["render_enabled"]:
+            self._json(503, {"error": "navigateur désactivé (option render_enabled)"})
+            return
+        service = (qs.get("service") or [""])[0]
+        conversation = (qs.get("conversation") or [""])[0]
+        if chemin == "/navigateur_lire":
+            code, corps = navigateur_lire(service, conversation)
+        else:
+            code, corps = navigateur_dire(service, (qs.get("texte") or [""])[0],
+                                          conversation)
+        self._json(code, corps)
 
     def _route_render(self, qs: dict) -> None:
         """La page avec son JS exécuté. Mêmes verrous que /fetch, via _verrous()."""
